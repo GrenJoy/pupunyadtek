@@ -215,8 +215,8 @@ async def find_latest_schedule_post(client: TelegramClient, channel_username: st
     try:
         logger.info(f"🔍 Ищу посты в канале @{channel_username}...")
         
-        # Берём последние 20 постов для проверки (увеличено с 3 для надёжности)
-        messages = await client.get_messages(channel_username, limit=20)
+        # Берём последние 3 поста для проверки
+        messages = await client.get_messages(channel_username, limit=3)
         logger.info(f"📊 Получено {len(messages)} последних постов для проверки")
         
         # Собираем все подходящие посты с их schedule_type
