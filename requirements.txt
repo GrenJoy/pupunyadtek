@@ -1,0 +1,12 @@
+python-telegram-bot==21.7
+google-generativeai==0.8.3
+Pillow==10.4.0
+python-dotenv==1.0.1
+telethon==1.36.0
+pytz==2024.1
+psycopg[binary]==3.2.12
+
+
+fastapi==0.109.2
+uvicorn==0.27.1
+python-multipart==0.0.9

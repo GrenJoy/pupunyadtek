@@ -1,0 +1,5 @@
+{
+  "name": "Power Outage Schedule Bot",
+  "description": "A web application to manage and view electricity outage schedules by parsing uploaded images of schedules using the Gemini API. It simulates a Telegram bot interface for managing cities, people, and their corresponding power outage groups.",
+  "requestFramePermissions": []
+}
