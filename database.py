@@ -304,6 +304,17 @@ class Database:
                 # Поле уже существует или другая ошибка - игнорируем
                 pass
         
+        # Таблица групп людей (для мониторинга графиков группы)
+        cursor.execute(self._adapt_sql("""
+            CREATE TABLE IF NOT EXISTS person_groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                person_id INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (person_id) REFERENCES people(id) ON DELETE CASCADE,
+                UNIQUE(person_id)
+            )
+        """))
+        
         conn.commit()
         conn.close()
         logger.info(f"✅ База данных инициализирована ({self.db_type})")
@@ -935,5 +946,117 @@ class Database:
         except Exception as e:
             logger.error(f"❌ Ошибка при получении last_message_id: {e}")
             return 0
+        finally:
+            conn.close()
+    
+    # Работа с группами людей
+    def create_person_group(self, person_ids: List[int]) -> bool:
+        """
+        Создает группу людей. При создании новой группы старая автоматически удаляется.
+        
+        Args:
+            person_ids: Список ID людей для добавления в группу
+        
+        Returns:
+            True если успешно, False если ошибка
+        """
+        if not person_ids:
+            logger.warning("⚠️ Попытка создать пустую группу")
+            return False
+        
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        placeholder = self._get_placeholder()
+        
+        try:
+            # Удаляем старую группу (если есть)
+            cursor.execute("DELETE FROM person_groups")
+            
+            # Добавляем новых людей в группу
+            for person_id in person_ids:
+                # Проверяем, существует ли человек
+                cursor.execute(f"SELECT id FROM people WHERE id = {placeholder}", (person_id,))
+                if cursor.fetchone():
+                    cursor.execute(
+                        f"INSERT INTO person_groups (person_id) VALUES ({placeholder})",
+                        (person_id,)
+                    )
+                else:
+                    logger.warning(f"⚠️ Человек с ID {person_id} не найден, пропускаю")
+            
+            conn.commit()
+            logger.info(f"✅ Создана группа из {len(person_ids)} человек")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Ошибка при создании группы: {e}")
+            conn.rollback()
+            return False
+        finally:
+            conn.close()
+    
+    def get_person_group(self) -> List[Person]:
+        """
+        Получает всех людей из текущей группы.
+        
+        Returns:
+            Список людей в группе
+        """
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute("""
+                SELECT p.id, p.name, p.city_id, p.group_name
+                FROM person_groups pg
+                JOIN people p ON pg.person_id = p.id
+                ORDER BY p.name
+            """)
+            people = [Person(id=row[0], name=row[1], city_id=row[2], group=row[3]) for row in cursor.fetchall()]
+            return people
+        except Exception as e:
+            logger.error(f"❌ Ошибка при получении группы: {e}")
+            return []
+        finally:
+            conn.close()
+    
+    def delete_person_group(self) -> bool:
+        """
+        Удаляет текущую группу людей (только связку, не самих людей).
+        
+        Returns:
+            True если успешно, False если ошибка
+        """
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute("DELETE FROM person_groups")
+            conn.commit()
+            logger.info("✅ Группа людей удалена")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Ошибка при удалении группы: {e}")
+            conn.rollback()
+            return False
+        finally:
+            conn.close()
+    
+    def has_person_group(self) -> bool:
+        """
+        Проверяет, есть ли созданная группа людей.
+        
+        Returns:
+            True если группа существует, False если нет
+        """
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute("SELECT COUNT(*) FROM person_groups")
+            count = cursor.fetchone()[0]
+            return count > 0
+        except Exception as e:
+            logger.error(f"❌ Ошибка при проверке группы: {e}")
+            return False
         finally:
             conn.close()

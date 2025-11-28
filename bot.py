@@ -25,6 +25,7 @@ from gemini_service import analyze_schedule_image, generate_schedule_response, c
 from helpers import get_schedule_status, get_kyiv_time
 from constants import ELECTRICITY_GROUPS
 from channel_fetcher import find_and_process_schedule_for_user, get_schedule_photos_from_channel
+from group_schedule import generate_group_schedule_message
 
 # Настройка логирования
 logging.basicConfig(
@@ -89,7 +90,8 @@ def get_main_menu_keyboard():
             InlineKeyboardButton("📅 Посмотреть график", callback_data="view_schedule"),
             InlineKeyboardButton("📸 Загрузить график", callback_data="upload_schedule")
         ],
-        [InlineKeyboardButton("🏙️ Управление городами", callback_data="manage_cities")]
+        [InlineKeyboardButton("🏙️ Управление городами", callback_data="manage_cities")],
+        [InlineKeyboardButton("👥 График группы", callback_data="view_group_schedule")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -858,6 +860,7 @@ async def manage_people(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("➕ Добавить человека", callback_data="add_person")],
         [InlineKeyboardButton("✏️ Редактировать человека", callback_data="edit_person")],
         [InlineKeyboardButton("🗑️ Удалить человека", callback_data="delete_person")],
+        [InlineKeyboardButton("👥 Создать группу людей", callback_data="create_group")],
         [InlineKeyboardButton("🔙 Назад", callback_data="main_menu")]
     ]
     
@@ -1280,6 +1283,193 @@ async def confirm_delete_person(update: Update, context: ContextTypes.DEFAULT_TY
         )
     else:
         await query.edit_message_text("❌ Человек не найден.", reply_markup=get_back_keyboard())
+
+
+# ========== УПРАВЛЕНИЕ ГРУППОЙ ЛЮДЕЙ ==========
+
+async def create_group_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начало создания группы - показывает список всех людей"""
+    query = update.callback_query
+    await query.answer()
+    
+    # Получаем всех людей из всех городов
+    all_people = db.get_people()
+    
+    if not all_people:
+        await query.edit_message_text(
+            "❌ Нет людей в базе данных.\n\nСначала добавьте людей через 'Управление людьми' → 'Добавить человека'.",
+            reply_markup=get_back_keyboard(),
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    user_id = update.effective_user.id
+    if user_id not in user_context:
+        user_context[user_id] = {}
+    user_context[user_id]["group_selected_people"] = []
+    
+    # Формируем список людей с информацией о городе
+    keyboard = []
+    for person in all_people:
+        city = db.get_city(person.city_id)
+        city_name = city.name if city else f"ID {person.city_id}"
+        # Используем префикс для отслеживания выбранных людей
+        keyboard.append([InlineKeyboardButton(
+            f"☐ {person.name} ({city_name}, группа {person.group})",
+            callback_data=f"group_toggle_{person.id}"
+        )])
+    
+    keyboard.append([InlineKeyboardButton("✅ Создать группу", callback_data="group_create")])
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="manage_people")])
+    
+    await query.edit_message_text(
+        "👥 <b>Создать группу людей</b>\n\n"
+        "Выберите людей для группы (можно выбрать несколько):\n\n"
+        f"Всего людей: {len(all_people)}\n"
+        f"Выбрано: 0",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.HTML
+    )
+
+
+async def group_toggle_person(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Переключение выбора человека в группе"""
+    query = update.callback_query
+    await query.answer()
+    
+    person_id = int(query.data.split("_")[-1])
+    user_id = update.effective_user.id
+    
+    if user_id not in user_context:
+        user_context[user_id] = {}
+    if "group_selected_people" not in user_context[user_id]:
+        user_context[user_id]["group_selected_people"] = []
+    
+    selected = user_context[user_id]["group_selected_people"]
+    
+    # Переключаем выбор
+    if person_id in selected:
+        selected.remove(person_id)
+    else:
+        selected.append(person_id)
+    
+    # Получаем всех людей
+    all_people = db.get_people()
+    
+    # Формируем обновленный список
+    keyboard = []
+    for person in all_people:
+        city = db.get_city(person.city_id)
+        city_name = city.name if city else f"ID {person.city_id}"
+        is_selected = person.id in selected
+        prefix = "☑" if is_selected else "☐"
+        keyboard.append([InlineKeyboardButton(
+            f"{prefix} {person.name} ({city_name}, группа {person.group})",
+            callback_data=f"group_toggle_{person.id}"
+        )])
+    
+    keyboard.append([InlineKeyboardButton("✅ Создать группу", callback_data="group_create")])
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="manage_people")])
+    
+    await query.edit_message_text(
+        "👥 <b>Создать группу людей</b>\n\n"
+        "Выберите людей для группы (можно выбрать несколько):\n\n"
+        f"Всего людей: {len(all_people)}\n"
+        f"Выбрано: {len(selected)}",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.HTML
+    )
+
+
+async def group_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Создание группы из выбранных людей"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = update.effective_user.id
+    
+    if user_id not in user_context or "group_selected_people" not in user_context[user_id]:
+        await query.edit_message_text(
+            "❌ Ошибка. Начните заново.",
+            reply_markup=get_back_keyboard(),
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    selected_people_ids = user_context[user_id]["group_selected_people"]
+    
+    if not selected_people_ids:
+        await query.edit_message_text(
+            "❌ Выберите хотя бы одного человека для группы.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Назад", callback_data="create_group")
+            ]]),
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    # Создаем группу (старая автоматически удаляется)
+    success = db.create_person_group(selected_people_ids)
+    
+    if success:
+        # Получаем имена выбранных людей для сообщения
+        selected_people = [db.get_person(pid) for pid in selected_people_ids]
+        people_names = [p.name for p in selected_people if p]
+        
+        await query.edit_message_text(
+            f"✅ <b>Группа создана!</b>\n\n"
+            f"В группе {len(selected_people_ids)} человек:\n"
+            f"{', '.join(people_names)}\n\n"
+            f"Теперь вы можете посмотреть график группы через главное меню.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Назад", callback_data="manage_people")
+            ]]),
+            parse_mode=ParseMode.HTML
+        )
+        
+        # Очищаем контекст
+        user_context[user_id].pop("group_selected_people", None)
+    else:
+        await query.edit_message_text(
+            "❌ Ошибка при создании группы. Попробуйте снова.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Назад", callback_data="create_group")
+            ]]),
+            parse_mode=ParseMode.HTML
+        )
+
+
+async def view_group_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает график для всех людей из группы"""
+    query = update.callback_query
+    await query.answer()
+    
+    # Проверяем, есть ли группа
+    if not db.has_person_group():
+        await query.edit_message_text(
+            "❌ Группа не создана.\n\n"
+            "Создайте группу через 'Управление людьми' → 'Создать группу людей'.",
+            reply_markup=get_back_keyboard(),
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    # Генерируем сообщение с графиками группы
+    try:
+        message = generate_group_schedule_message(db)
+        
+        await query.edit_message_text(
+            message,
+            reply_markup=get_back_keyboard(),
+            parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
+        logger.error(f"Ошибка при генерации графика группы: {e}", exc_info=True)
+        await query.edit_message_text(
+            f"❌ Ошибка при формировании графика группы: {str(e)}",
+            reply_markup=get_back_keyboard(),
+            parse_mode=ParseMode.HTML
+        )
 
 
 # ========== ЗАГРУЗКА ГРАФИКА ==========
@@ -2885,6 +3075,12 @@ def main():
     
     # Обработчики управления людьми
     application.add_handler(CallbackQueryHandler(manage_people, pattern="^manage_people$"))
+    
+    # Обработчики для работы с группами людей
+    application.add_handler(CallbackQueryHandler(create_group_start, pattern="^create_group$"))
+    application.add_handler(CallbackQueryHandler(group_toggle_person, pattern="^group_toggle_"))
+    application.add_handler(CallbackQueryHandler(group_create, pattern="^group_create$"))
+    application.add_handler(CallbackQueryHandler(view_group_schedule, pattern="^view_group_schedule$"))
     application.add_handler(CallbackQueryHandler(add_person_start, pattern="^add_person$"))
     application.add_handler(CallbackQueryHandler(edit_person_start, pattern="^edit_person$"))
     application.add_handler(CallbackQueryHandler(delete_person_start, pattern="^delete_person$"))
