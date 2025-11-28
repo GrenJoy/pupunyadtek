@@ -44,30 +44,31 @@ def format_person_schedule_block(
     block = f"👤 <b>{person.name}</b> (группа {person.group})\n"
     block += f"🏙️ Місто: {city_name}\n"
     
+    
     # График на сегодня
     if today_date:
         block += f"📅 {today_date}\n"
     
     if schedule_intervals_today:
         intervals_text = "\n".join([f"• {interval}" for interval in schedule_intervals_today])
-        block += f"⚡ Графік відключень на сьогодні:\n{intervals_text}\n"
+        block += f"⚡ Графік відключень на сьогодні:\n{intervals_text}\n\n"
     else:
-        block += "⚡ Графік відключень на сьогодні:\nГрафик не загружен.\n"
+        block += "⚡ Графік відключень на сьогодні:\nГрафик не загружен.\n\n"
     
     # График на завтра
     if schedule_intervals_tomorrow:
         if tomorrow_date:
             block += f"📅 {tomorrow_date}\n"
         intervals_tomorrow_text = "\n".join([f"• {interval}" for interval in schedule_intervals_tomorrow])
-        block += f"⚡ Графік відключень на завтра:\n{intervals_tomorrow_text}\n"
+        block += f"⚡ Графік відключень на завтра:\n{intervals_tomorrow_text}\n\n"
     
     # Текущее время и статус
     current_time_str = current_time.strftime('%H:%M')
     block += f"🕐 Поточний час: {current_time_str}\n"
     block += f"{status['message']}\n"
-    block += f"{status['nextChange']}\n"
+    block += status['nextChange']
     if status['timeToNextChange']:
-        block += f"{status['timeToNextChange']}"
+        block += f"\n{status['timeToNextChange']}"
     
     return block
 
