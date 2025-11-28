@@ -55,12 +55,15 @@ def format_person_schedule_block(
     else:
         block += "⚡ Графік відключень на сьогодні:\nГрафик не загружен.\n\n"
     
-    # График на завтра
+    # График на завтра (всегда показываем, даже если данных нет)
+    if tomorrow_date:
+        block += f"📅 {tomorrow_date}\n"
+    
     if schedule_intervals_tomorrow:
-        if tomorrow_date:
-            block += f"📅 {tomorrow_date}\n"
         intervals_tomorrow_text = "\n".join([f"• {interval}" for interval in schedule_intervals_tomorrow])
         block += f"⚡ Графік відключень на завтра:\n{intervals_tomorrow_text}\n\n"
+    else:
+        block += "⚡ Графік відключень на завтра:\nГрафик не загружен.\n\n"
     
     # Текущее время и статус
     current_time_str = current_time.strftime('%H:%M')

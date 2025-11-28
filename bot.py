@@ -8,7 +8,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Dict, List
 from io import BytesIO
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -2995,8 +2995,16 @@ def main():
     if not bot_token:
         raise ValueError("TELEGRAM_BOT_TOKEN не установлен. Установите переменную окружения TELEGRAM_BOT_TOKEN.")
     
-    # Создаем приложение
-    application = Application.builder().token(bot_token).build()
+    # Устанавливаем команды бота (появляется кнопка меню у пользователя)
+    async def post_init(app: Application) -> None:
+        """Инициализация после запуска бота - устанавливает команды меню"""
+        await app.bot.set_my_commands([
+            BotCommand("start", "🏠 Главное меню")
+        ])
+        logger.info("✅ Команды бота установлены (кнопка меню активирована)")
+    
+    # Создаем приложение с post_init для установки команд меню
+    application = Application.builder().token(bot_token).post_init(post_init).build()
     
     # Обработчик команды /start
     application.add_handler(CommandHandler("start", start))
