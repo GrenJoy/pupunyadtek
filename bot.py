@@ -21,7 +21,7 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 
 from database import Database
-from gemini_service import analyze_schedule_image, generate_schedule_response
+from gemini_service import analyze_schedule_image, generate_schedule_response, check_schedule_post_and_date, analyze_schedule_text, is_complete_schedule, merge_schedules
 from helpers import get_schedule_status, get_kyiv_time
 from constants import ELECTRICITY_GROUPS
 from channel_fetcher import find_and_process_schedule_for_user, get_schedule_photos_from_channel
@@ -54,6 +54,7 @@ user_context: Dict[int, Dict] = {}
 # Глобальные переменные для хранения ссылки на мониторинг
 monitor_thread = None
 monitor_instance = None  # Ссылка на экземпляр ChannelMonitor для остановки
+monitoring_restart_in_progress = False  # Флаг для предотвращения одновременных перезапусков
 
 # Список заблокированных каналов (нельзя добавлять в мониторинг)
 BLOCKED_CHANNELS = [
@@ -1371,7 +1372,7 @@ async def upload_manual_start(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.edit_message_text(
         f"📤 <b>Загрузить свой график</b>\n\n"
         f"Город: <b>{city.name}</b>\n\n"
-        "Отправьте 1-3 фото с графиками отключений.\n"
+        "Отправьте 1-3 фото с графиками отключений ИЛИ текст с графиком.\n"
         "Бот автоматически распознает их с помощью Gemini AI.",
         reply_markup=get_back_keyboard(),
         parse_mode=ParseMode.HTML
@@ -1821,6 +1822,113 @@ async def handle_schedule_photo(update: Update, context: ContextTypes.DEFAULT_TY
                 InlineKeyboardButton("✅ Готово", callback_data="upload_schedule_done")
             ]])
         )
+
+
+async def handle_schedule_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка текстового поста с графиком"""
+    user_id = update.effective_user.id
+    
+    if user_id not in user_context or "upload_schedule_city_id" not in user_context[user_id]:
+        await update.message.reply_text(
+            "❌ Ошибка. Начните заново.",
+            reply_markup=get_back_keyboard()
+        )
+        return ConversationHandler.END
+    
+    city_id = user_context[user_id]["upload_schedule_city_id"]
+    city = db.get_city(city_id)
+    text = update.message.text or ""
+    
+    if not text or len(text.strip()) == 0:
+        await update.message.reply_text(
+            "⚠️ Текст пустой. Отправьте текст с графиком отключений или фото.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Готово", callback_data="upload_schedule_done")
+            ]])
+        )
+        return WAITING_SCHEDULE_PHOTO
+    
+    await update.message.reply_text("⚙️ Распознавание графика из текста...")
+    
+    try:
+        # Проверяем через Gemini - это график и определяем дату
+        schedule_type = await asyncio.to_thread(check_schedule_post_and_date, text)
+        
+        if not schedule_type:
+            await update.message.reply_text(
+                "⚠️ Не удалось распознать график в тексте.\n\n"
+                "Убедитесь, что текст содержит график отключений с группами и интервалами.\n"
+                "Попробуйте отправить другое сообщение или фото.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Готово", callback_data="upload_schedule_done")
+                ]])
+            )
+            return WAITING_SCHEDULE_PHOTO
+        
+        # Извлекаем данные графика из текста
+        schedule_data = await asyncio.to_thread(analyze_schedule_text, text)
+        
+        if not schedule_data or len(schedule_data) == 0:
+            await update.message.reply_text(
+                "⚠️ Не удалось извлечь данные графика из текста.\n\n"
+                "Попробуйте отправить другое сообщение или фото.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Готово", callback_data="upload_schedule_done")
+                ]])
+            )
+            return WAITING_SCHEDULE_PHOTO
+        
+        groups_list = list(schedule_data.keys())
+        logger.info(f"📝 Текст обработан. Распознано групп: {len(schedule_data)}, дата: {schedule_type}")
+        logger.info(f"   Группы: {groups_list}")
+        
+        # Получаем старый график
+        old_schedule = db.get_schedule(city_id, schedule_type) or {}
+        
+        # Сохраняем график (объединяем с существующим, если нужно)
+        if is_complete_schedule(schedule_data, old_schedule):
+            db.save_schedule(city_id, schedule_data, schedule_type)
+            final_schedule = schedule_data
+        else:
+            if old_schedule:
+                merged_schedule = merge_schedules(old_schedule, schedule_data)
+                db.save_schedule(city_id, merged_schedule, schedule_type)
+                final_schedule = merged_schedule
+            else:
+                db.save_schedule(city_id, schedule_data, schedule_type)
+                final_schedule = schedule_data
+        
+        # Отправляем уведомления подписчикам
+        if context and context.application:
+            asyncio.create_task(notify_subscribers_about_schedule_update(
+                context.application, city_id, city.name, old_schedule, final_schedule
+            ))
+        
+        date_label = "сегодня" if schedule_type == "today" else "завтра"
+        groups_count = len(final_schedule)
+        
+        await update.message.reply_text(
+            f"✅ График распознан и сохранён!\n\n"
+            f"📅 Дата: {date_label}\n"
+            f"📊 Распознано групп: {groups_count}\n\n"
+            "Можете отправить ещё текст или фото, или нажмите 'Готово'.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Готово", callback_data="upload_schedule_done")
+            ]])
+        )
+        
+        return WAITING_SCHEDULE_PHOTO
+        
+    except Exception as e:
+        logger.error(f"Ошибка при обработке текста графика: {e}", exc_info=True)
+        await update.message.reply_text(
+            f"❌ Ошибка при распознавании: {str(e)}\n\n"
+            "Попробуйте отправить другое сообщение или фото, или нажмите 'Готово'.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Готово", callback_data="upload_schedule_done")
+            ]])
+        )
+        return WAITING_SCHEDULE_PHOTO
 
 
 async def upload_schedule_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2848,6 +2956,7 @@ def main():
         states={
             WAITING_SCHEDULE_PHOTO: [
                 MessageHandler(filters.PHOTO, handle_schedule_photo),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_schedule_text),
                 CallbackQueryHandler(upload_schedule_done, pattern="^upload_schedule_done$")
             ],
         },
@@ -2930,6 +3039,124 @@ def main():
         monitoring_thread = threading.Thread(target=start_monitoring_delayed, daemon=True)
         monitoring_thread.start()
         logger.info("⏰ Запланирован запуск мониторинга через 10 минут")
+        
+        # Функция для периодической проверки и автозапуска мониторинга
+        def check_and_restart_monitoring():
+            """Проверяет периодически, работает ли мониторинг, и перезапускает если нет"""
+            import time
+            # Интервал проверки в секундах (по умолчанию 60 минут = 3600 секунд)
+            check_interval_minutes = int(os.getenv("MONITORING_CHECK_INTERVAL_MINUTES", "60"))
+            check_interval = check_interval_minutes * 60
+            logger.info(f"⏰ Автоматическая проверка мониторинга будет выполняться каждые {check_interval_minutes} минут")
+            
+            # Первая проверка через 5 минут после запуска (чтобы дать время мониторингу запуститься)
+            time.sleep(300)  # 5 минут
+            
+            while True:
+                try:
+                    global monitor_instance, monitor_thread, monitoring_restart_in_progress
+                    
+                    # ВАЖНО: Проверяем, не идет ли уже перезапуск
+                    if monitoring_restart_in_progress:
+                        logger.debug("⏸️ Перезапуск мониторинга уже выполняется, пропускаю проверку")
+                        continue
+                    
+                    # Проверяем, работает ли мониторинг
+                    is_running = False
+                    if monitor_instance and hasattr(monitor_instance, 'is_running'):
+                        is_running = monitor_instance.is_running
+                    
+                    # Проверяем, жив ли поток
+                    thread_alive = monitor_thread and monitor_thread.is_alive() if monitor_thread else False
+                    
+                    # Дополнительная проверка: проверяем, что клиент подключен
+                    client_connected = False
+                    if monitor_instance and hasattr(monitor_instance, 'client') and monitor_instance.client:
+                        try:
+                            # Проверяем, подключен ли клиент (неблокирующая проверка)
+                            client_connected = monitor_instance.client.is_connected() if hasattr(monitor_instance.client, 'is_connected') else True
+                        except:
+                            client_connected = False
+                    
+                    # Мониторинг считается работающим только если ВСЕ условия выполнены
+                    monitoring_ok = is_running and thread_alive and client_connected
+                    
+                    if not monitoring_ok:
+                        # Устанавливаем флаг, чтобы предотвратить одновременные перезапуски
+                        if monitoring_restart_in_progress:
+                            logger.debug("⏸️ Перезапуск уже выполняется другим потоком")
+                            continue
+                        
+                        monitoring_restart_in_progress = True
+                        
+                        logger.warning("=" * 60)
+                        logger.warning("⚠️ МОНИТОРИНГ НЕ РАБОТАЕТ!")
+                        logger.warning("=" * 60)
+                        logger.warning(f"   is_running: {is_running}")
+                        logger.warning(f"   thread_alive: {thread_alive}")
+                        logger.warning(f"   client_connected: {client_connected}")
+                        logger.warning("🔄 Автоматически перезапускаю мониторинг...")
+                        logger.warning("=" * 60)
+                        
+                        # Останавливаем старый мониторинг, если он есть
+                        if monitor_instance:
+                            try:
+                                monitor_instance.is_running = False
+                                if hasattr(monitor_instance, 'client') and monitor_instance.client:
+                                    import asyncio
+                                    stop_loop = asyncio.new_event_loop()
+                                    asyncio.set_event_loop(stop_loop)
+                                    try:
+                                        stop_loop.run_until_complete(monitor_instance.client.disconnect())
+                                    except:
+                                        pass
+                                    finally:
+                                        stop_loop.close()
+                                time.sleep(2)
+                            except Exception as e:
+                                logger.warning(f"Не удалось остановить старый мониторинг: {e}")
+                            
+                            # Очищаем ссылку на старый экземпляр
+                            monitor_instance = None
+                        
+                        # Очищаем ссылку на старый поток
+                        monitor_thread = None
+                        
+                        # Запускаем новый мониторинг
+                        try:
+                            from channel_monitor import start_monitor_task
+                            monitor_instance_ref = [None]
+                            monitor_thread = start_monitor_task(db, application, monitor_instance_ref)
+                            
+                            # Ждём, пока monitor_instance будет создан
+                            for _ in range(10):
+                                if monitor_instance_ref[0] is not None:
+                                    monitor_instance = monitor_instance_ref[0]
+                                    break
+                                time.sleep(0.5)
+                            
+                            if monitor_instance:
+                                logger.info("✅ Мониторинг успешно перезапущен автоматически")
+                            else:
+                                logger.warning("⚠️ Не удалось получить ссылку на monitor_instance после перезапуска")
+                        except Exception as e:
+                            logger.error(f"❌ Ошибка при автоматическом перезапуске мониторинга: {e}", exc_info=True)
+                        finally:
+                            # Снимаем флаг перезапуска
+                            monitoring_restart_in_progress = False
+                    else:
+                        logger.debug(f"✅ Мониторинг работает нормально (is_running={is_running}, thread_alive={thread_alive}, client_connected={client_connected})")
+                        
+                except Exception as e:
+                    logger.error(f"❌ Ошибка в функции проверки мониторинга: {e}", exc_info=True)
+                
+                # Ждём перед следующей проверкой
+                time.sleep(check_interval)
+        
+        # Запускаем проверку мониторинга в отдельном потоке
+        monitoring_check_thread = threading.Thread(target=check_and_restart_monitoring, daemon=True)
+        monitoring_check_thread.start()
+        logger.info("✅ Запущена автоматическая проверка мониторинга (каждые 60 минут)")
     else:
         logger.info("TELEGRAM_API_ID и TELEGRAM_API_HASH не установлены. Мониторинг канала отключен.")
     

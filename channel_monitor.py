@@ -1029,73 +1029,20 @@ class ChannelMonitor:
                                         logger.info(f"{'='*60}")
                                         logger.info(f"   📌 ID: {msg.id}")
                                         logger.info(f"   📅 Время: {msg.date.strftime('%Y-%m-%d %H:%M:%S') if msg.date else 'Неизвестно'}")
-                                        logger.info(f"   📝 Текст: {text[:150] if text else 'Нет текста'}...")
+                                        logger.info(f"   📝 Текст: {text[:200] if text else 'Нет текста'}...")
                                         
-                                        # Проверяем ключевые слова
-                                        has_keywords = self.should_download_post(text)
+                                        # Проверяем наличие фото
+                                        has_photo = msg.photo or (hasattr(msg, 'grouped_id') and msg.grouped_id)
                                         
-                                        if has_keywords:
-                                            # Есть keywords - проверяем фото или текст
-                                            has_photo = msg.photo or (hasattr(msg, 'grouped_id') and msg.grouped_id)
-                                            
-                                            if has_photo:
-                                                logger.info(f"   📸 Обрабатываю пост ID {msg.id} (с фото)...")
-                                                success = await self.download_and_process_photos(msg, channel_to_city_map)
-                                                if success:
-                                                    logger.info(f"   ✅ Пост ID {msg.id} обработан!")
-                                            else:
-                                                # Нет фото, но есть keywords - проверяем текст
-                                                logger.info(f"   📝 Проверяю текст поста ID {msg.id}...")
-                                                from gemini_service import is_schedule_post, analyze_schedule_text
-                                                
-                                                # Проверяем через Gemini (выполняем в отдельном потоке)
-                                                is_schedule = await asyncio.to_thread(is_schedule_post, text)
-                                                if is_schedule:
-                                                    schedule_data = await asyncio.to_thread(analyze_schedule_text, text)
-                                                    if schedule_data and len(schedule_data) > 0:
-                                                        # Определяем город и сохраняем (логика аналогична handler)
-                                                        city_name = None
-                                                        if channel_to_city_map:
-                                                            city_name = channel_to_city_map.get(channel_username)
-                                                        
-                                                        if not city_name:
-                                                            city_name = self.extract_city_from_text(text)
-                                                        
-                                                        if not city_name:
-                                                            cities = self.db.get_cities()
-                                                            city_name = cities[0].name if cities else "Днепр"
-                                                        
-                                                        cities = self.db.get_cities()
-                                                        city = next((c for c in cities if c.name.lower() == city_name.lower()), None)
-                                                        
-                                                        if not city:
-                                                            try:
-                                                                city_id = self.db.add_city(city_name)
-                                                                city = self.db.get_city(city_id)
-                                                            except:
-                                                                city = None
-                                                        
-                                                        if city:
-                                                            schedule_type = self.extract_date_from_text(text)
-                                                            if schedule_type is None:
-                                                                schedule_type = "tomorrow"
-                                                            
-                                                            old_schedule = self.db.get_schedule(city.id, schedule_type) or {}
-                                                            from gemini_service import is_complete_schedule, merge_schedules
-                                                            
-                                                            if is_complete_schedule(schedule_data, old_schedule):
-                                                                self.db.save_schedule(city.id, schedule_data, schedule_type)
-                                                            else:
-                                                                if old_schedule:
-                                                                    merged_schedule = merge_schedules(old_schedule, schedule_data)
-                                                                    self.db.save_schedule(city.id, merged_schedule, schedule_type)
-                                                                else:
-                                                                    self.db.save_schedule(city.id, schedule_data, schedule_type)
-                                                            
-                                                            final_groups = len([k for k in (self.db.get_schedule(city.id, schedule_type) or {}).keys() if k != '_meta'])
-                                                            logger.info(f"   ✅ График ({schedule_type}) из текста сохранён для поста ID {msg.id}. Всего групп: {final_groups}")
-                                        elif text and len(text) > 50:
-                                            # Нет keywords, но текст длинный - проверяем через Gemini
+                                        if has_photo:
+                                            schedule_type = None  # Fix UnboundLocalError
+                                            logger.info(f"   📸 Обнаружены фотографии, начинаю обработку...")
+                                            logger.info(f"   🤖 Отправляю фото в Gemini Vision для анализа...")
+                                            success = await self.download_and_process_photos(msg, channel_to_city_map)
+                                            if success:
+                                                logger.info(f"   ✅ Пост ID {msg.id} обработан!")
+                                        elif text and len(text.strip()) > 0:
+                                            # Нет фото, но есть текст - проверяем через Gemini
                                             from gemini_service import check_schedule_post_and_date, analyze_schedule_text
                                             
                                             # Проверяем через Gemini (выполняем в отдельном потоке)
@@ -1315,20 +1262,11 @@ class ChannelMonitor:
                     logger.info(f"   📌 ID: {message.id}")
                     logger.info(f"   📝 Текст: {text[:200] if text else 'Нет текста'}...")
                     
-                    # Проверяем ключевые слова
-                    logger.info(f"   🔍 ШАГ 1: Проверка ключевых слов...")
-                    has_keywords = self.should_download_post(text)
-                    if not has_keywords and text:
-                        logger.info(f"   ⚠️ Пост НЕ содержит ключевых слов из списка KEYWORDS")
-                        logger.debug(f"   🔍 Проверяемые ключевые слова: {KEYWORDS[:5]}... (всего {len(KEYWORDS)})")
+                    # Проверяем наличие фото
+                    has_photo = message.photo or (hasattr(message, 'grouped_id') and message.grouped_id)
                     
-                    if has_keywords:
-                        logger.info(f"   ✅ Пост содержит ключевые слова! Продолжаю обработку...")
-                        
-                        # Проверяем наличие фото
-                        has_photo = message.photo or (hasattr(message, 'grouped_id') and message.grouped_id)
-                        
-                        if has_photo:
+                    if has_photo:
+                            schedule_type = None  # Fix UnboundLocalError
                             logger.info(f"   📸 Обнаружены фотографии, начинаю обработку...")
                             logger.info(f"   🤖 ШАГ 2: Отправляю фото в Gemini Vision для анализа...")
                             
@@ -1469,55 +1407,11 @@ class ChannelMonitor:
                             else:
                                 logger.warning(f"   ❌ Не удалось извлечь данные из фото")
 
-                        else:
-                            # Нет фото, но есть keywords - график в тексте
-                            logger.info(f"   📝 Пост без фото, проверяю текст...")
-                            
-                            # ВАЖНО: Выполняем анализ в отдельном потоке!
-                            # Используем новую функцию, которая сразу определяет и график, и дату
-                            from gemini_service import check_schedule_post_and_date, analyze_schedule_text
-                            
-                            logger.info(f"   🤖 ШАГ 2: Отправляю текст в Gemini для проверки (график/игнор + дата)...")
-                            schedule_type = await asyncio.to_thread(check_schedule_post_and_date, text)
-                            if schedule_type:
-                                logger.info(f"   ✅ Gemini ответил: это график отключений ({schedule_type})!")
-                                logger.info(f"   🤖 ШАГ 3: Извлекаю данные графика из текста через Gemini...")
-                                # ТОЛЬКО если Gemini подтвердил, что это график - извлекаем данные
-                                schedule_data = await asyncio.to_thread(analyze_schedule_text, text)
-                                if schedule_data and len(schedule_data) > 0:
-                                    groups_list = list(schedule_data.keys())
-                                    logger.info(f"   ✅ Gemini извлёк данные: {len(schedule_data)} групп - {groups_list}")
-                                    if monitored_channel_obj: # Use the stored channel object
-                                        city = self.db.get_city(monitored_channel_obj.city_id)
-                                        if city:
-                                            old_schedule = self.db.get_schedule(city.id, schedule_type) or {}
-                                            from gemini_service import is_complete_schedule, merge_schedules
-                                            
-                                            if is_complete_schedule(schedule_data, old_schedule):
-                                                self.db.save_schedule(city.id, schedule_data, schedule_type)
-                                            else:
-                                                if old_schedule:
-                                                    merged_schedule = merge_schedules(old_schedule, schedule_data)
-                                                    self.db.save_schedule(city.id, merged_schedule, schedule_type)
-                                                else:
-                                                    self.db.save_schedule(city.id, schedule_data, schedule_type)
-                                            
-                                            logger.info(f"   💾 График ({schedule_type}) из текста сохранен для {city.name}")
-                                            
-                                            # Отправляем уведомление
-                                            final_schedule = self.db.get_schedule(city.id, schedule_type) or schedule_data
-                                            await self._notify_subscribers_about_changes(city.id, city.name, old_schedule or {}, final_schedule, schedule_type)
-                                else:
-                                    logger.warning("   ⚠️ Gemini подтвердил график, но не удалось извлечь данные")
-                            else:
-                                logger.info("   ❌ Gemini: это НЕ график (игнор) - пропускаю пост")
-                                # ВАЖНО: analyze_schedule_text() НЕ вызывается, если check_schedule_post_and_date() вернул None
-
                     else:
-                        # Нет keywords - проверяем через Gemini если текст длинный
-                        if text and len(text) > 50:
-                            logger.info(f"   📝 Пост без keywords, но текст длинный ({len(text)} символов)")
-                            logger.info(f"   🤖 ШАГ 2: Отправляю текст в Gemini для проверки (график/игнор + дата)...")
+                        # Нет фото - проверяем через Gemini если есть текст
+                        if text and len(text.strip()) > 0:
+                            logger.info(f"   📝 Пост без фото, текст ({len(text)} символов) - проверяю через Gemini...")
+                            logger.info(f"   🤖 Отправляю текст в Gemini для проверки (график/игнор + дата)...")
                             
                             from gemini_service import check_schedule_post_and_date, analyze_schedule_text
                             
@@ -1555,7 +1449,7 @@ class ChannelMonitor:
                                 logger.info("   ❌ Gemini: это НЕ график (игнор) - пропускаю пост")
                                 logger.debug(f"   💡 Причина: пост не содержит графика с группами и интервалами (возможно, это аварийное сообщение, новость или обновление одной группы)")
                         else:
-                            logger.debug(f"   ⏭️ Пост без keywords и короткий текст ({len(text) if text else 0} символов) - пропускаю")
+                            logger.debug(f"   ⏭️ Пост без фото и без текста - пропускаю")
                     
                     # ВАЖНО: Сохраняем ID только после полной обработки поста
                     # Это предотвращает повторную обработку одного и того же поста
