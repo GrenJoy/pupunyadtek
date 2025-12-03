@@ -2142,7 +2142,9 @@ async def upload_schedule_done(update: Update, context: ContextTypes.DEFAULT_TYP
         if groups_count > 0 and context and context.application:
             # Получаем старый график для сравнения (если он был до загрузки)
             # Но так как график уже сохранён, используем финальный как новый
-            asyncio.create_task(notify_subscribers_about_schedule_update(context.application, city_id, city.name, {}, final_schedule))
+            # Объединяем графики на сегодня и завтра для уведомления
+            final_schedule_combined = {**final_schedule_today, **final_schedule_tomorrow}
+            asyncio.create_task(notify_subscribers_about_schedule_update(context.application, city_id, city.name, {}, final_schedule_combined))
         
         user_context[user_id].pop("upload_schedule_city_id", None)
         user_context[user_id].pop("upload_schedule_photos", None)
