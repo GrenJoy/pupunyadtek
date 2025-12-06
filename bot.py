@@ -441,10 +441,8 @@ async def city_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("✏️ Редактировать название", callback_data=f"edit_city_name_{city_id}")],
         [InlineKeyboardButton("📱 Управление каналом", callback_data=f"manage_channel_{city_id}")],
-        [
-            InlineKeyboardButton("🗑️ Очистить график (сегодня)", callback_data=f"clear_schedule_today_{city_id}"),
-            InlineKeyboardButton("🗑️ Очистить график (завтра)", callback_data=f"clear_schedule_tomorrow_{city_id}")
-        ],
+        [InlineKeyboardButton("🗑️ Очистить график (сегодня)", callback_data=f"clear_schedule_today_{city_id}")],
+        [InlineKeyboardButton("🗑️ Очистить график (завтра)", callback_data=f"clear_schedule_tomorrow_{city_id}")],
         [InlineKeyboardButton("🗑️ Удалить город", callback_data=f"delete_city_{city_id}")],
         [InlineKeyboardButton("🔙 Назад", callback_data="manage_cities")]
     ]
