@@ -580,6 +580,48 @@ class Database:
         finally:
             conn.close()
     
+    def clear_schedule(self, city_id: int, schedule_type: str = "today"):
+        """
+        Очистить график для города
+        
+        Args:
+            city_id: ID города
+            schedule_type: Тип графика - "today" или "tomorrow" (по умолчанию "today")
+        """
+        if schedule_type not in ["today", "tomorrow"]:
+            raise ValueError(f"schedule_type должен быть 'today' или 'tomorrow', получен: {schedule_type}")
+        
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        placeholder = self._get_placeholder()
+        field_name = "schedule_today" if schedule_type == "today" else "schedule_tomorrow"
+        
+        try:
+            if self.db_type == "postgresql":
+                # PostgreSQL: обновляем поле на NULL
+                cursor.execute(
+                    f"""UPDATE schedules 
+                       SET {field_name} = NULL, updated_at = CURRENT_TIMESTAMP 
+                       WHERE city_id = {placeholder}""",
+                    (city_id,)
+                )
+            else:
+                # SQLite: обновляем поле на NULL
+                cursor.execute(
+                    f"""UPDATE schedules 
+                       SET {field_name} = NULL, updated_at = CURRENT_TIMESTAMP 
+                       WHERE city_id = {placeholder}""",
+                    (city_id,)
+                )
+            conn.commit()
+            logger.info(f"✅ График ({schedule_type}) очищен для города {city_id}")
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"❌ Ошибка при очистке графика ({schedule_type}) для города {city_id}: {e}")
+            raise
+        finally:
+            conn.close()
+    
     def get_schedule(self, city_id: int, schedule_type: str = "today") -> Optional[Dict[str, List[str]]]:
         """
         Получить график для города

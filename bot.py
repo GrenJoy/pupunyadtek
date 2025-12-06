@@ -377,6 +377,38 @@ async def confirm_delete_city(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.edit_message_text("❌ Город не найден.", reply_markup=get_back_keyboard())
 
 
+async def clear_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Очистка графика (сегодня или завтра)"""
+    query = update.callback_query
+    await query.answer()
+    
+    # Парсим callback_data: clear_schedule_today_{city_id} или clear_schedule_tomorrow_{city_id}
+    parts = query.data.split("_")
+    schedule_type = parts[2]  # "today" или "tomorrow"
+    city_id = int(parts[-1])
+    
+    city = db.get_city(city_id)
+    
+    if not city:
+        await query.edit_message_text("❌ Город не найден.", reply_markup=get_back_keyboard())
+        return
+    
+    # Очищаем график
+    try:
+        db.clear_schedule(city_id, schedule_type)
+        schedule_type_ukr = "сьогодні" if schedule_type == "today" else "завтра"
+        await query.edit_message_text(
+            f"✅ График на {schedule_type_ukr} для города '{city.name}' очищен.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data=f"city_details_{city_id}")]])
+        )
+    except Exception as e:
+        logger.error(f"Ошибка при очистке графика: {e}")
+        await query.edit_message_text(
+            f"❌ Ошибка при очистке графика: {e}",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data=f"city_details_{city_id}")]])
+        )
+
+
 async def city_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Детали города - меню с опциями"""
     query = update.callback_query
@@ -409,6 +441,10 @@ async def city_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("✏️ Редактировать название", callback_data=f"edit_city_name_{city_id}")],
         [InlineKeyboardButton("📱 Управление каналом", callback_data=f"manage_channel_{city_id}")],
+        [
+            InlineKeyboardButton("🗑️ Очистить график (сегодня)", callback_data=f"clear_schedule_today_{city_id}"),
+            InlineKeyboardButton("🗑️ Очистить график (завтра)", callback_data=f"clear_schedule_tomorrow_{city_id}")
+        ],
         [InlineKeyboardButton("🗑️ Удалить город", callback_data=f"delete_city_{city_id}")],
         [InlineKeyboardButton("🔙 Назад", callback_data="manage_cities")]
     ]
@@ -3029,6 +3065,7 @@ def main():
     # НЕ регистрируем add_city_start отдельно - он уже в ConversationHandler
     application.add_handler(CallbackQueryHandler(delete_city, pattern="^delete_city_"))
     application.add_handler(CallbackQueryHandler(confirm_delete_city, pattern="^confirm_delete_city_"))
+    application.add_handler(CallbackQueryHandler(clear_schedule, pattern="^clear_schedule_(today|tomorrow)_"))
     application.add_handler(CallbackQueryHandler(city_details, pattern="^city_details_"))
     # НЕ регистрируем edit_city_name_start отдельно - он уже в ConversationHandler
     application.add_handler(CallbackQueryHandler(manage_channel, pattern="^manage_channel_"))

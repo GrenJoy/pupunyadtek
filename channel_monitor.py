@@ -1262,8 +1262,35 @@ class ChannelMonitor:
                     logger.info(f"   📌 ID: {message.id}")
                     logger.info(f"   📝 Текст: {text[:200] if text else 'Нет текста'}...")
                     
-                    # Получаем время публикации поста для новой системы
-                    post_time_kyiv = get_kyiv_time()
+                    # Получаем реальное время публикации поста и конвертируем в Киев
+                    from datetime import datetime
+                    try:
+                        # message.date в Telethon - это datetime объект (может быть UTC или naive)
+                        if message.date:
+                            if message.date.tzinfo is None:
+                                # Если naive datetime, считаем что это UTC
+                                from datetime import timezone
+                                post_time_utc = message.date.replace(tzinfo=timezone.utc)
+                            else:
+                                post_time_utc = message.date
+                            
+                            # Конвертируем в Киев
+                            try:
+                                from zoneinfo import ZoneInfo
+                                kyiv_tz = ZoneInfo("Europe/Kyiv")
+                            except ImportError:
+                                import pytz
+                                kyiv_tz = pytz.timezone("Europe/Kyiv")
+                            
+                            post_time_kyiv = post_time_utc.astimezone(kyiv_tz)
+                            logger.info(f"   📅 Время поста: {post_time_kyiv.strftime('%H:%M %d.%m.%Y')}")
+                        else:
+                            # Fallback на текущее время, если дата не доступна
+                            post_time_kyiv = get_kyiv_time()
+                            logger.warning(f"   ⚠️ Дата поста недоступна, использую текущее время")
+                    except Exception as e:
+                        logger.warning(f"   ⚠️ Ошибка при получении времени поста: {e}, использую текущее время")
+                        post_time_kyiv = get_kyiv_time()
                     
                     # Проверяем наличие фото
                     has_photo = message.photo or (hasattr(message, 'grouped_id') and message.grouped_id)
@@ -1284,9 +1311,20 @@ class ChannelMonitor:
                                     chat_username or ""
                                 )
                             elif has_photo:
-                                # Если есть фото, но нет текста - это полный график (обычно на завтра)
-                                msg_type = "full_tomorrow"
-                                logger.info(f"   📸 Фото без текста → определяю как full_tomorrow")
+                                # Если есть фото, но нет текста - определяем по дате поста
+                                from datetime import timedelta
+                                current_time = get_kyiv_time()
+                                today_date = current_time.date()
+                                post_date = post_time_kyiv.date()
+                                
+                                # Если пост опубликован сегодня и время раннее (до 12:00) - скорее всего график на сегодня
+                                # Если пост опубликован сегодня после 12:00 или завтра - график на завтра
+                                if post_date == today_date and post_time_kyiv.hour < 12:
+                                    msg_type = "full_today"
+                                    logger.info(f"   📸 Фото без текста (сегодня до 12:00) → определяю как full_today")
+                                else:
+                                    msg_type = "full_tomorrow"
+                                    logger.info(f"   📸 Фото без текста → определяю как full_tomorrow")
                             else:
                                 # Нет ни текста, ни фото - игнорируем
                                 msg_type = "ignore"
@@ -1466,8 +1504,7 @@ class ChannelMonitor:
                         if text and len(text.strip()) > 0:
                             logger.info(f"   📝 Пост без фото, текст ({len(text)} символов) - проверяю через Gemini...")
                             
-                            # Получаем время публикации поста
-                            post_time_kyiv = get_kyiv_time()
+                            # Время поста уже получено выше
                             
                             # Определяем тип сообщения (новая универсальная функция)
                             from gemini_service import detect_schedule_message_type, apply_dnipro_partial_update, analyze_schedule_image, analyze_schedule_text
