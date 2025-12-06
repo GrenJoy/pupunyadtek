@@ -1423,6 +1423,8 @@ class ChannelMonitor:
                                     # === ПОЛНЫЙ ГРАФИК (фото) ===
                                     if msg_type.startswith("full_"):
                                         logger.info(f"   Полный график (альбом) → {target_day}")
+                                        logger.info(f"   🔄 ПОЛНАЯ ЗАМЕНА: старый график будет полностью заменён новым (не объединение!)")
+                                        logger.info(f"   📊 Старый график: {len(old_schedule)} групп, новый график: {len(merged_schedule)} групп")
                                         self.db.save_schedule(city.id, merged_schedule, target_day)
                                         await self._notify_subscribers_about_changes(
                                             city.id, city.name, old_schedule, merged_schedule, target_day
@@ -1467,6 +1469,8 @@ class ChannelMonitor:
                                         # === ПОЛНЫЙ ГРАФИК (фото) ===
                                         if msg_type.startswith("full_"):
                                             logger.info(f"   Полный график (одно фото) → {target_day}")
+                                            logger.info(f"   🔄 ПОЛНАЯ ЗАМЕНА: старый график будет полностью заменён новым (не объединение!)")
+                                            logger.info(f"   📊 Старый график: {len(old_schedule)} групп, новый график: {len(schedule_data)} групп")
                                             self.db.save_schedule(city.id, schedule_data, target_day)
                                             await self._notify_subscribers_about_changes(
                                                 city.id, city.name, old_schedule, schedule_data, target_day
@@ -1550,10 +1554,13 @@ class ChannelMonitor:
                             # === ПОЛНЫЙ ГРАФИК (фото или длинный текст) ===
                             if msg_type.startswith("full_"):
                                 logger.info(f"   Полный график → {target_day}")
+                                logger.info(f"   🔄 ПОЛНАЯ ЗАМЕНА: старый график будет полностью заменён новым (не объединение!)")
+                                logger.info(f"   📊 Старый график: {len(old_schedule)} групп, новый график будет извлечён из текста")
                                 
                                 schedule_data = await asyncio.to_thread(analyze_schedule_text, text)
                                 
                                 if schedule_data and len(schedule_data) >= 6:
+                                    logger.info(f"   📊 Новый график: {len(schedule_data)} групп - ПОЛНОСТЬЮ заменяет старый")
                                     self.db.save_schedule(city.id, schedule_data, target_day)
                                     await self._notify_subscribers_about_changes(
                                         city.id, city.name, old_schedule, schedule_data, target_day
@@ -1596,19 +1603,31 @@ class ChannelMonitor:
                                         groups_list = list(schedule_data.keys())
                                         logger.info(f"   ✅ Gemini извлёк данные: {len(schedule_data)} групп - {groups_list}")
                                         
-                                        if is_complete_schedule(schedule_data, old_schedule):
+                                        # КРИТИЧЕСКИ ВАЖНО: Если это full_* тип, то ПОЛНОСТЬЮ заменяем, не объединяем!
+                                        if msg_type.startswith("full_"):
+                                            logger.info(f"   🔄 ПОЛНАЯ ЗАМЕНА для других городов: старый график будет полностью заменён новым")
+                                            logger.info(f"   📊 Старый график: {len(old_schedule)} групп, новый график: {len(schedule_data)} групп")
                                             self.db.save_schedule(city.id, schedule_data, schedule_type)
+                                            final_schedule = schedule_data
+                                        elif is_complete_schedule(schedule_data, old_schedule):
+                                            # Если график полный (но не определён как full_*), тоже заменяем полностью
+                                            logger.info(f"   🔄 Полный график (определён через is_complete_schedule): заменяем полностью")
+                                            self.db.save_schedule(city.id, schedule_data, schedule_type)
+                                            final_schedule = schedule_data
                                         else:
+                                            # Только для частичных обновлений объединяем
+                                            logger.info(f"   🔄 Частичное обновление: объединяем со старым графиком")
                                             if old_schedule:
                                                 merged_schedule = merge_schedules(old_schedule, schedule_data)
                                                 self.db.save_schedule(city.id, merged_schedule, schedule_type)
+                                                final_schedule = merged_schedule
                                             else:
                                                 self.db.save_schedule(city.id, schedule_data, schedule_type)
+                                                final_schedule = schedule_data
                                         
                                         logger.info(f"   💾 График ({schedule_type}) из текста сохранен для {city.name}")
                                         
                                         # Отправляем уведомление
-                                        final_schedule = self.db.get_schedule(city.id, schedule_type) or schedule_data
                                         await self._notify_subscribers_about_changes(city.id, city.name, old_schedule or {}, final_schedule, schedule_type)
                                 else:
                                     logger.info("   ❌ Это НЕ график (игнор) - пропускаю пост")
