@@ -1302,8 +1302,13 @@ class ChannelMonitor:
                             # Определяем тип сообщения (новая универсальная функция)
                             from gemini_service import detect_schedule_message_type, analyze_schedule_image, apply_dnipro_partial_update
                             
+                            # Быстрая проверка на ЦЕК/ЦЕЦ перед отправкой в Gemini
+                            text_lower = (text or "").lower()
+                            if "цек" in text_lower or "цец" in text_lower:
+                                msg_type = "ignore"
+                                logger.info("   ⏭️ Игнорируем (ЦЕК/ЦЕЦ - другой поставщик)")
                             # ВАЖНО: Если есть фото, но нет текста или текст короткий - это скорее всего полный график
-                            if text and len(text.strip()) >= 10:
+                            elif text and len(text.strip()) >= 10:
                                 msg_type = await asyncio.to_thread(
                                     detect_schedule_message_type,
                                     text,
@@ -1312,6 +1317,7 @@ class ChannelMonitor:
                                 )
                             elif has_photo:
                                 # Если есть фото, но нет текста - определяем по дате поста
+                                # Проверку ЦЕК/ЦЕЦ на фото сделает analyze_schedule_image (вернет пустой словарь)
                                 from datetime import timedelta
                                 current_time = get_kyiv_time()
                                 today_date = current_time.date()
