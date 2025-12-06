@@ -12,7 +12,7 @@ from telethon.tl.types import MessageMediaPhoto
 
 from database import Database
 from gemini_service import analyze_schedule_image, generate_schedule_response
-from helpers import get_schedule_status
+from helpers import get_schedule_status, get_kyiv_time
 from constants import KEYWORDS
 
 # ВАЖНО: Загружаем переменные окружения из .env файла
@@ -1262,25 +1262,59 @@ class ChannelMonitor:
                     logger.info(f"   📌 ID: {message.id}")
                     logger.info(f"   📝 Текст: {text[:200] if text else 'Нет текста'}...")
                     
+                    # Получаем время публикации поста для новой системы
+                    post_time_kyiv = get_kyiv_time()
+                    
                     # Проверяем наличие фото
                     has_photo = message.photo or (hasattr(message, 'grouped_id') and message.grouped_id)
                     
                     if has_photo:
-                            schedule_type = None  # Fix UnboundLocalError
                             logger.info(f"   📸 Обнаружены фотографии, начинаю обработку...")
                             logger.info(f"   🤖 ШАГ 2: Отправляю фото в Gemini Vision для анализа...")
                             
-                            # Скачиваем фото (для одного фото или альбома)
-                            # Используем существующий метод, но он блокирующий внутри (analyze_schedule_image)
-                            # Поэтому лучше реализовать логику здесь, вызывая analyze_schedule_image через to_thread
+                            # Определяем тип сообщения (новая универсальная функция)
+                            from gemini_service import detect_schedule_message_type, analyze_schedule_image, apply_dnipro_partial_update
                             
-                            # ВАЖНО: Используем process_photo, но нужно убедиться что он не блокирует
-                            # process_photo вызывает analyze_schedule_image.
-                            # Чтобы исправить блокировку, нужно изменить process_photo или вызвать его в отдельном потоке?
-                            # process_photo делает и БД операции, так что лучше изменить его внутри или здесь переписать логику.
+                            # ВАЖНО: Если есть фото, но нет текста или текст короткий - это скорее всего полный график
+                            if text and len(text.strip()) >= 10:
+                                msg_type = await asyncio.to_thread(
+                                    detect_schedule_message_type,
+                                    text,
+                                    post_time_kyiv,
+                                    chat_username or ""
+                                )
+                            elif has_photo:
+                                # Если есть фото, но нет текста - это полный график (обычно на завтра)
+                                msg_type = "full_tomorrow"
+                                logger.info(f"   📸 Фото без текста → определяю как full_tomorrow")
+                            else:
+                                # Нет ни текста, ни фото - игнорируем
+                                msg_type = "ignore"
                             
-                            # Перепишем логику здесь для надежности и неблокируемости
-                            from gemini_service import analyze_schedule_image
+                            logger.info(f"   Сообщение: {msg_type} | @{chat_username}")
+                            
+                            if msg_type == "ignore":
+                                logger.info("   Игнорируем (ЦЕК, вода, мусор, авария)")
+                                self.save_last_message_id(message.id, chat_username)
+                                return
+                            
+                            # Определяем день
+                            if "today" in msg_type:
+                                target_day = "today"
+                            else:
+                                target_day = "tomorrow"
+                            
+                            city = self.db.get_city(monitored_channel_obj.city_id) if monitored_channel_obj else None
+                            if not city:
+                                logger.warning(f"   ⚠️ Город не найден для канала @{chat_username}")
+                                self.save_last_message_id(message.id, chat_username)
+                                return
+                            
+                            old_schedule = self.db.get_schedule(city.id, target_day) or {}
+                            
+                            # Определяем, является ли канал Днепром
+                            is_dnipro = city.name.lower() in ["днепр", "дніпро", "dnipro"] or \
+                                        (chat_username and "dniproavariyka" in chat_username.lower())
                             
                             success = False
                             processed_groups = 0
@@ -1342,25 +1376,31 @@ class ChannelMonitor:
                                 logger.info(f"   📊 Обработано {photo_count} фото из альбома, всего групп: {len(merged_schedule)}")
                                 
                                 if success and merged_schedule:
-                                    # Определяем schedule_type для альбома (если не определён)
-                                    if schedule_type is None:
-                                        from gemini_service import check_schedule_post_and_date
-                                        logger.info(f"   🤖 Определяю дату графика через Gemini...")
-                                        schedule_type = await asyncio.to_thread(check_schedule_post_and_date, text)
-                                        if schedule_type is None:
-                                            schedule_type = "tomorrow"  # По умолчанию
-                                        logger.info(f"   📅 Определена дата: {schedule_type}")
-                                    
-                                    # Сохраняем
-                                    if monitored_channel_obj: # Use the stored channel object
-                                        city = self.db.get_city(monitored_channel_obj.city_id) 
-                                        if city:
-                                            old_schedule = self.db.get_schedule(city.id, schedule_type) or {}
-                                            self.db.save_schedule(city.id, merged_schedule, schedule_type)
-                                            logger.info(f"   💾 График ({schedule_type}, альбом) сохранен для {city.name}")
-                                            
-                                            # Отправляем уведомление
-                                            await self._notify_subscribers_about_changes(city.id, city.name, old_schedule or {}, merged_schedule, schedule_type)
+                                    # === ПОЛНЫЙ ГРАФИК (фото) ===
+                                    if msg_type.startswith("full_"):
+                                        logger.info(f"   Полный график (альбом) → {target_day}")
+                                        self.db.save_schedule(city.id, merged_schedule, target_day)
+                                        await self._notify_subscribers_about_changes(
+                                            city.id, city.name, old_schedule, merged_schedule, target_day
+                                        )
+                                    # === ЧАСТИЧНОЕ ОБНОВЛЕНИЕ — ТОЛЬКО ДНЕПР ===
+                                    elif msg_type.startswith("partial_") and is_dnipro:
+                                        logger.info(f"   Частичное обновление Днепра (альбом) → {target_day}")
+                                        # Для фото с частичным обновлением объединяем со старым графиком
+                                        from gemini_service import merge_schedules
+                                        if old_schedule:
+                                            merged_schedule = merge_schedules(old_schedule, merged_schedule)
+                                        self.db.save_schedule(city.id, merged_schedule, target_day)
+                                        await self._notify_subscribers_about_changes(
+                                            city.id, city.name, old_schedule, merged_schedule, target_day
+                                        )
+                                    else:
+                                        # Для других городов - просто сохраняем
+                                        logger.info(f"   График (альбом) для других городов → {target_day}")
+                                        self.db.save_schedule(city.id, merged_schedule, target_day)
+                                        await self._notify_subscribers_about_changes(
+                                            city.id, city.name, old_schedule, merged_schedule, target_day
+                                        )
                             
                             # Если одно фото
                             elif message.photo:
@@ -1380,25 +1420,39 @@ class ChannelMonitor:
                                         groups_list = list(schedule_data.keys())
                                         logger.info(f"   ✅ Gemini вернул данные: {len(schedule_data)} групп - {groups_list}")
                                         
-                                        # Определяем schedule_type для фото (если не определён)
-                                        if schedule_type is None:
-                                            from gemini_service import check_schedule_post_and_date
-                                            logger.info(f"   🤖 Определяю дату графика через Gemini...")
-                                            schedule_type = await asyncio.to_thread(check_schedule_post_and_date, text)
-                                            if schedule_type is None:
-                                                schedule_type = "tomorrow"  # По умолчанию
-                                            logger.info(f"   📅 Определена дата: {schedule_type}")
-                                        
-                                        if monitored_channel_obj: # Use the stored channel object
-                                            city = self.db.get_city(monitored_channel_obj.city_id)
-                                            if city:
-                                                old_schedule = self.db.get_schedule(city.id, schedule_type) or {}
-                                                self.db.save_schedule(city.id, schedule_data, schedule_type)
-                                                logger.info(f"   💾 График ({schedule_type}) сохранен для {city.name}")
-                                                success = True
-                                                
-                                                # Отправляем уведомление
-                                                await self._notify_subscribers_about_changes(city.id, city.name, old_schedule or {}, schedule_data, schedule_type)
+                                        # === ПОЛНЫЙ ГРАФИК (фото) ===
+                                        if msg_type.startswith("full_"):
+                                            logger.info(f"   Полный график (одно фото) → {target_day}")
+                                            self.db.save_schedule(city.id, schedule_data, target_day)
+                                            await self._notify_subscribers_about_changes(
+                                                city.id, city.name, old_schedule, schedule_data, target_day
+                                            )
+                                            success = True
+                                        # === ЧАСТИЧНОЕ ОБНОВЛЕНИЕ — ТОЛЬКО ДНЕПР ===
+                                        elif msg_type.startswith("partial_") and is_dnipro:
+                                            logger.info(f"   Частичное обновление Днепра (одно фото) → {target_day}")
+                                            # Для фото с частичным обновлением объединяем со старым графиком
+                                            from gemini_service import merge_schedules
+                                            if old_schedule:
+                                                merged_schedule = merge_schedules(old_schedule, schedule_data)
+                                                self.db.save_schedule(city.id, merged_schedule, target_day)
+                                                await self._notify_subscribers_about_changes(
+                                                    city.id, city.name, old_schedule, merged_schedule, target_day
+                                                )
+                                            else:
+                                                self.db.save_schedule(city.id, schedule_data, target_day)
+                                                await self._notify_subscribers_about_changes(
+                                                    city.id, city.name, old_schedule, schedule_data, target_day
+                                                )
+                                            success = True
+                                        else:
+                                            # Для других городов - просто сохраняем
+                                            logger.info(f"   График (одно фото) для других городов → {target_day}")
+                                            self.db.save_schedule(city.id, schedule_data, target_day)
+                                            await self._notify_subscribers_about_changes(
+                                                city.id, city.name, old_schedule, schedule_data, target_day
+                                            )
+                                            success = True
                                     else:
                                         logger.warning(f"   ⚠️ Gemini не вернул данные для фото")
                             
@@ -1408,46 +1462,113 @@ class ChannelMonitor:
                                 logger.warning(f"   ❌ Не удалось извлечь данные из фото")
 
                     else:
-                        # Нет фото - проверяем через Gemini если есть текст
+                        # === НОВАЯ ЛОГИКА: Обработка текстовых постов с определением типа ===
                         if text and len(text.strip()) > 0:
                             logger.info(f"   📝 Пост без фото, текст ({len(text)} символов) - проверяю через Gemini...")
-                            logger.info(f"   🤖 Отправляю текст в Gemini для проверки (график/игнор + дата)...")
                             
-                            from gemini_service import check_schedule_post_and_date, analyze_schedule_text
+                            # Получаем время публикации поста
+                            post_time_kyiv = get_kyiv_time()
                             
-                            # Проверяем через Gemini (выполняем в отдельном потоке)
-                            # Используем новую функцию, которая сразу определяет и график, и дату
-                            schedule_type = await asyncio.to_thread(check_schedule_post_and_date, text)
-                            if schedule_type:
-                                logger.info(f"   ✅ Gemini ответил: это график отключений ({schedule_type})!")
-                                logger.info(f"   🤖 ШАГ 3: Извлекаю данные графика из текста через Gemini...")
-                                schedule_data = await asyncio.to_thread(analyze_schedule_text, text)
-                                if schedule_data and len(schedule_data) > 0:
-                                    groups_list = list(schedule_data.keys())
-                                    logger.info(f"   ✅ Gemini извлёк данные: {len(schedule_data)} групп - {groups_list}")
-                                    if monitored_channel_obj:
-                                        city = self.db.get_city(monitored_channel_obj.city_id)
-                                        if city:
-                                            old_schedule = self.db.get_schedule(city.id, schedule_type) or {}
-                                            from gemini_service import is_complete_schedule, merge_schedules
-                                            
-                                            if is_complete_schedule(schedule_data, old_schedule):
-                                                self.db.save_schedule(city.id, schedule_data, schedule_type)
-                                            else:
-                                                if old_schedule:
-                                                    merged_schedule = merge_schedules(old_schedule, schedule_data)
-                                                    self.db.save_schedule(city.id, merged_schedule, schedule_type)
-                                                else:
-                                                    self.db.save_schedule(city.id, schedule_data, schedule_type)
-                                            
-                                            logger.info(f"   💾 График ({schedule_type}) из текста сохранен для {city.name}")
-                                            
-                                            # Отправляем уведомление
-                                            final_schedule = self.db.get_schedule(city.id, schedule_type) or schedule_data
-                                            await self._notify_subscribers_about_changes(city.id, city.name, old_schedule or {}, final_schedule, schedule_type)
+                            # Определяем тип сообщения (новая универсальная функция)
+                            from gemini_service import detect_schedule_message_type, apply_dnipro_partial_update, analyze_schedule_image, analyze_schedule_text
+                            
+                            msg_type = await asyncio.to_thread(
+                                detect_schedule_message_type,
+                                text,
+                                post_time_kyiv,
+                                chat_username or ""
+                            )
+                            
+                            logger.info(f"   Сообщение: {msg_type} | @{chat_username}")
+                            
+                            if msg_type == "ignore":
+                                logger.info("   Игнорируем (ЦЕК, вода, мусор, авария)")
+                                self.save_last_message_id(message.id, chat_username)
+                                return
+                            
+                            # Определяем день
+                            if "today" in msg_type:
+                                target_day = "today"
                             else:
-                                logger.info("   ❌ Gemini: это НЕ график (игнор) - пропускаю пост")
-                                logger.debug(f"   💡 Причина: пост не содержит графика с группами и интервалами (возможно, это аварийное сообщение, новость или обновление одной группы)")
+                                target_day = "tomorrow"
+                            
+                            city = self.db.get_city(monitored_channel_obj.city_id) if monitored_channel_obj else None
+                            if not city:
+                                logger.warning(f"   ⚠️ Город не найден для канала @{chat_username}")
+                                self.save_last_message_id(message.id, chat_username)
+                                return
+                            
+                            old_schedule = self.db.get_schedule(city.id, target_day) or {}
+                            
+                            # Определяем, является ли канал Днепром
+                            is_dnipro = city.name.lower() in ["днепр", "дніпро", "dnipro"] or \
+                                        (chat_username and "dniproavariyka" in chat_username.lower())
+                            
+                            # === ПОЛНЫЙ ГРАФИК (фото или длинный текст) ===
+                            if msg_type.startswith("full_"):
+                                logger.info(f"   Полный график → {target_day}")
+                                
+                                schedule_data = await asyncio.to_thread(analyze_schedule_text, text)
+                                
+                                if schedule_data and len(schedule_data) >= 6:
+                                    self.db.save_schedule(city.id, schedule_data, target_day)
+                                    await self._notify_subscribers_about_changes(
+                                        city.id, city.name, old_schedule, schedule_data, target_day
+                                    )
+                            
+                            # === ЧАСТИЧНОЕ ОБНОВЛЕНИЕ — ТОЛЬКО ДНЕПР ===
+                            elif msg_type.startswith("partial_") and is_dnipro:
+                                logger.info(f"   Частичное обновление Днепра → {target_day}")
+                                new_schedule = await asyncio.to_thread(
+                                    apply_dnipro_partial_update,
+                                    old_schedule,
+                                    text,
+                                    post_time_kyiv.strftime("%H:%M")
+                                )
+                                if new_schedule != old_schedule:
+                                    self.db.save_schedule(city.id, new_schedule, target_day)
+                                    await self._notify_subscribers_about_changes(
+                                        city.id, city.name, old_schedule, new_schedule, target_day
+                                    )
+                            
+                            # === ОБРАБОТКА ДЛЯ ДРУГИХ ГОРОДОВ (не Днепр) ===
+                            else:
+                                logger.info(f"   Обработка для других городов (не Днепр)")
+                                # Для других городов используем старую логику, но через новую функцию определения типа
+                                from gemini_service import analyze_schedule_text, is_complete_schedule, merge_schedules
+                                
+                                # Преобразуем новый тип в старый формат для совместимости
+                                if msg_type.startswith("full_"):
+                                    schedule_type = target_day
+                                elif msg_type.startswith("partial_"):
+                                    # Для частичных обновлений других городов используем merge_schedules
+                                    schedule_type = target_day
+                                else:
+                                    schedule_type = None
+                                
+                                if schedule_type:
+                                    logger.info(f"   ✅ Это график отключений ({schedule_type})!")
+                                    schedule_data = await asyncio.to_thread(analyze_schedule_text, text)
+                                    if schedule_data and len(schedule_data) > 0:
+                                        groups_list = list(schedule_data.keys())
+                                        logger.info(f"   ✅ Gemini извлёк данные: {len(schedule_data)} групп - {groups_list}")
+                                        
+                                        if is_complete_schedule(schedule_data, old_schedule):
+                                            self.db.save_schedule(city.id, schedule_data, schedule_type)
+                                        else:
+                                            if old_schedule:
+                                                merged_schedule = merge_schedules(old_schedule, schedule_data)
+                                                self.db.save_schedule(city.id, merged_schedule, schedule_type)
+                                            else:
+                                                self.db.save_schedule(city.id, schedule_data, schedule_type)
+                                        
+                                        logger.info(f"   💾 График ({schedule_type}) из текста сохранен для {city.name}")
+                                        
+                                        # Отправляем уведомление
+                                        final_schedule = self.db.get_schedule(city.id, schedule_type) or schedule_data
+                                        await self._notify_subscribers_about_changes(city.id, city.name, old_schedule or {}, final_schedule, schedule_type)
+                                else:
+                                    logger.info("   ❌ Это НЕ график (игнор) - пропускаю пост")
                         else:
                             logger.debug(f"   ⏭️ Пост без фото и без текста - пропускаю")
                     
