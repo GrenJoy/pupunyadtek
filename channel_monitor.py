@@ -1527,6 +1527,7 @@ class ChannelMonitor:
                             )
                             
                             logger.info(f"   Сообщение: {msg_type} | @{chat_username}")
+                            logger.info(f"   📅 Время поста: {post_time_kyiv.strftime('%H:%M %d.%m.%Y')}")
                             
                             if msg_type == "ignore":
                                 logger.info("   Игнорируем (ЦЕК, вода, мусор, авария)")
@@ -1536,8 +1537,10 @@ class ChannelMonitor:
                             # Определяем день
                             if "today" in msg_type:
                                 target_day = "today"
+                                logger.info(f"   ✅ Определён как график на СЕГОДНЯ ({target_day})")
                             else:
                                 target_day = "tomorrow"
+                                logger.info(f"   ✅ Определён как график на ЗАВТРА ({target_day})")
                             
                             city = self.db.get_city(monitored_channel_obj.city_id) if monitored_channel_obj else None
                             if not city:
