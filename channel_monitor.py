@@ -1562,12 +1562,50 @@ class ChannelMonitor:
                                 
                                 schedule_data = await asyncio.to_thread(analyze_schedule_text, text)
                                 
-                                if schedule_data and len(schedule_data) >= 6:
+                                # КРИТИЧЕСКИ ВАЖНЫЙ FALLBACK: Если график слишком маленький (<6 групп) - это подозрительно!
+                                # Скорее всего это частичное обновление, которое ошибочно классифицировано как full
+                                if schedule_data and len(schedule_data) < 6:
+                                    logger.warning(f"   ⚠️ ПОДОЗРИТЕЛЬНО: График имеет только {len(schedule_data)} групп (ожидалось ≥6)")
+                                    logger.warning(f"   ⚠️ Это может быть частичное обновление, ошибочно классифицированное как full!")
+                                    
+                                    # Если это Днепр - используем частичное обновление
+                                    if is_dnipro:
+                                        logger.info(f"   🔄 FALLBACK: Принудительно трактуем как partial_today и объединяем со старым графиком")
+                                        new_schedule = await asyncio.to_thread(
+                                            apply_dnipro_partial_update,
+                                            old_schedule,
+                                            text,
+                                            post_time_kyiv.strftime("%H:%M")
+                                        )
+                                        if new_schedule != old_schedule:
+                                            self.db.save_schedule(city.id, new_schedule, target_day)
+                                            await self._notify_subscribers_about_changes(
+                                                city.id, city.name, old_schedule, new_schedule, target_day
+                                            )
+                                    else:
+                                        # Для других городов - объединяем через merge_schedules
+                                        logger.info(f"   🔄 FALLBACK: Объединяем со старым графиком через merge_schedules")
+                                        from gemini_service import merge_schedules
+                                        if old_schedule:
+                                            merged_schedule = merge_schedules(old_schedule, schedule_data)
+                                            self.db.save_schedule(city.id, merged_schedule, target_day)
+                                            await self._notify_subscribers_about_changes(
+                                                city.id, city.name, old_schedule, merged_schedule, target_day
+                                            )
+                                        else:
+                                            # Если старого графика нет - сохраняем как есть
+                                            self.db.save_schedule(city.id, schedule_data, target_day)
+                                            await self._notify_subscribers_about_changes(
+                                                city.id, city.name, old_schedule or {}, schedule_data, target_day
+                                            )
+                                elif schedule_data and len(schedule_data) >= 6:
                                     logger.info(f"   📊 Новый график: {len(schedule_data)} групп - ПОЛНОСТЬЮ заменяет старый")
                                     self.db.save_schedule(city.id, schedule_data, target_day)
                                     await self._notify_subscribers_about_changes(
                                         city.id, city.name, old_schedule, schedule_data, target_day
                                     )
+                                else:
+                                    logger.warning(f"   ⚠️ Не удалось извлечь график из текста")
                             
                             # === ЧАСТИЧНОЕ ОБНОВЛЕНИЕ — ТОЛЬКО ДНЕПР ===
                             elif msg_type.startswith("partial_") and is_dnipro:
