@@ -44,6 +44,8 @@ class ChannelMonitor:
         self.last_processed_id = 0  # ID последнего обработанного поста
         self._processed_albums = set()  # Отслеживание обработанных альбомов (grouped_id)
         self._processed_albums_lock = None  # Будет инициализирован в start_monitoring (asyncio.Lock нельзя создать в __init__)
+        self._processing_messages = set()  # Отслеживание сообщений, которые сейчас обрабатываются (защита от повторной обработки)
+        self._processing_lock = None  # Lock для защиты от параллельной обработки одного поста
         
         if not API_ID or not API_HASH:
             logger.warning("TELEGRAM_API_ID и TELEGRAM_API_HASH не установлены. Мониторинг канала недоступен.")
@@ -972,6 +974,7 @@ class ChannelMonitor:
             
             # Инициализируем Lock для атомарных операций с альбомами
             self._processed_albums_lock = asyncio.Lock()
+            self._processing_lock = asyncio.Lock()  # Lock для защиты от параллельной обработки одного поста
             
             # Создаём словарь для быстрого доступа: channel_username -> city_name
             # Это позволяет быстро определить город по каналу без запросов к БД
@@ -1195,6 +1198,19 @@ class ChannelMonitor:
                     if last_processed_id > 0 and message.id <= last_processed_id:
                         logger.info(f"⏭️ Пропущен старый пост ID {message.id} (последний обработанный: {last_processed_id})")
                         return
+                    
+                    # КРИТИЧЕСКАЯ ЗАЩИТА: Проверяем, не обрабатывается ли уже этот пост (защита от повторной обработки)
+                    message_key = f"{chat_username}:{message.id}" if chat_username else f"{chat_id}:{message.id}"
+                    if self._processing_lock is None:
+                        logger.warning("⚠️ Processing lock не инициализирован, пропускаю проверку")
+                    else:
+                        async with self._processing_lock:
+                            if message_key in self._processing_messages:
+                                logger.warning(f"⏭️ Пропущен пост ID {message.id} - уже обрабатывается (защита от повторной обработки)")
+                                return
+                            # Помечаем пост как обрабатываемый
+                            self._processing_messages.add(message_key)
+                            logger.debug(f"🔒 Пост {message.id} помечен как обрабатываемый")
                     
                     # ВАЖНО: Для альбомов (grouped_id) обрабатываем только ПЕРВОЕ сообщение
                     # Используем Lock для атомарности (защита от race condition)
@@ -1680,9 +1696,26 @@ class ChannelMonitor:
                     if chat_username:
                         self.save_last_message_id(message.id, chat_username)
                         logger.debug(f"💾 Сохранён last_message_id={message.id} для канала @{chat_username}")
+                    
+                    # КРИТИЧЕСКИ ВАЖНО: Убираем пост из списка обрабатываемых
+                    # Это гарантирует, что пост будет удален даже при ошибке
+                    message_key = f"{chat_username}:{message.id}" if chat_username else f"{chat_id}:{message.id}"
+                    if self._processing_lock is not None:
+                        async with self._processing_lock:
+                            if message_key in self._processing_messages:
+                                self._processing_messages.remove(message_key)
+                                logger.debug(f"🔓 Пост {message.id} удален из списка обрабатываемых")
                         
                 except Exception as e:
                     logger.error(f"❌ Ошибка в обработчике сообщений: {e}", exc_info=True)
+                    # КРИТИЧЕСКИ ВАЖНО: Убираем пост из списка обрабатываемых даже при ошибке
+                    # Это предотвращает блокировку поста навсегда
+                    message_key = f"{chat_username}:{message.id}" if chat_username else f"{chat_id}:{message.id}"
+                    if self._processing_lock is not None:
+                        async with self._processing_lock:
+                            if message_key in self._processing_messages:
+                                self._processing_messages.remove(message_key)
+                                logger.debug(f"🔓 Пост {message.id} удален из списка обрабатываемых (после ошибки)")
             
             logger.info("\n🔍 Мониторинг активен! Жду новых постов...\n")
             
