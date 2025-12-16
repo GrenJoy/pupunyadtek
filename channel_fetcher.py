@@ -435,22 +435,22 @@ async def download_and_process_photo_from_message(
         logger.info("📝 Пост не содержит фото, проверяю текст...")
         
         if text and len(text) > 50:
-            from gemini_service import is_schedule_post, analyze_schedule_text, is_complete_schedule, merge_schedules
+            from gemini_service import check_schedule_post_and_date, analyze_schedule_text, is_complete_schedule, merge_schedules
             
-            # Проверяем через Gemini, является ли это графиком
+            # Проверяем через Gemini, является ли это графиком и определяем дату
             logger.info("🔍 Проверяю текст через Gemini...")
             try:
-                is_schedule = await asyncio.to_thread(is_schedule_post, text)
+                schedule_type = await asyncio.to_thread(check_schedule_post_and_date, text)
                 
-                if is_schedule:
-                    logger.info("✅ Gemini подтвердил: это график отключений!")
+                if schedule_type:
+                    logger.info(f"✅ Gemini подтвердил: это график отключений ({schedule_type})!")
                     
                     # Извлекаем график из текста
                     schedule_data = await asyncio.to_thread(analyze_schedule_text, text)
                     
                     if schedule_data and len(schedule_data) > 0:
                         logger.info(f"📊 Извлечено {len(schedule_data)} групп из текста")
-                        logger.info(f"   📅 Используется дата: {schedule_type or 'tomorrow'}")
+                        logger.info(f"   📅 Используется дата: {schedule_type}")
                         
                         # Получаем старый график для сравнения
                         old_schedule = db.get_schedule(city_id, schedule_type) or {}
