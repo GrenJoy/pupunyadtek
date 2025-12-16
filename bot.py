@@ -21,11 +21,20 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 
 from database import Database
-from gemini_service import analyze_schedule_image, generate_schedule_response, check_schedule_post_and_date, analyze_schedule_text, is_complete_schedule, merge_schedules
+from gemini_service import (
+    analyze_schedule_image, 
+    generate_schedule_response, 
+    check_schedule_post_and_date, 
+    analyze_schedule_text, 
+    is_complete_schedule, 
+    merge_schedules,
+    detect_schedule_message_type,
+    apply_dnipro_partial_update
+)
 from helpers import get_schedule_status, get_kyiv_time
 from constants import ELECTRICITY_GROUPS
 from channel_fetcher import find_and_process_schedule_for_user, get_schedule_photos_from_channel
-from group_schedule import generate_group_schedule_message
+from group_schedule import generate_group_schedule_message, format_person_schedule_block
 
 # Настройка логирования
 logging.basicConfig(
@@ -44,7 +53,8 @@ logger = logging.getLogger(__name__)
     WAITING_SCHEDULE_PHOTO,
     WAITING_CHANNEL_USERNAME,
     WAITING_EDIT_CITY_NAME,
-) = range(8)
+    WAITING_ADMIN_POST,
+) = range(9)
 
 # Инициализация базы данных
 db = Database()
@@ -225,6 +235,237 @@ async def handle_unknown_message_in_conversation(update: Update, context: Contex
         "Используйте кнопку 'Назад' для отмены или команду /start для возврата в главное меню.",
         reply_markup=get_back_keyboard()
     )
+
+
+# ========== ПАНЕЛЬ АДМИНИСТРАТОРА ==========
+
+def is_admin(user_id: int) -> bool:
+    """Проверяет, является ли пользователь администратором"""
+    admin_id = os.getenv("ADMIN_ID")
+    if not admin_id:
+        # Если ADMIN_ID не установлен, разрешаем всем (для разработки)
+        return True
+    try:
+        return str(user_id) == str(admin_id)
+    except:
+        return False
+
+
+async def admin_test_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /admin или /test_post - панель администратора для тестирования постов"""
+    user_id = update.effective_user.id
+    
+    if not is_admin(user_id):
+        await update.message.reply_text(
+            "❌ <b>Доступ запрещен</b>\n\n"
+            "Эта команда доступна только администратору.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    await update.message.reply_text(
+        "🔧 <b>Панель администратора</b>\n\n"
+        "Отправьте текст поста из канала для тестирования.\n"
+        "Бот обработает его через Gemini и покажет:\n"
+        "• Тип сообщения (full_today, partial_today, ignore и т.д.)\n"
+        "• График ДО изменений\n"
+        "• График ПОСЛЕ изменений\n\n"
+        "Используйте /cancel для отмены.",
+        parse_mode=ParseMode.HTML
+    )
+    
+    return WAITING_ADMIN_POST
+
+
+async def process_admin_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает текст поста от администратора"""
+    user_id = update.effective_user.id
+    
+    if not is_admin(user_id):
+        await update.message.reply_text("❌ Доступ запрещен")
+        return ConversationHandler.END
+    
+    text = update.message.text
+    
+    if not text or len(text.strip()) < 10:
+        await update.message.reply_text(
+            "❌ Текст слишком короткий. Отправьте полный текст поста."
+        )
+        return WAITING_ADMIN_POST
+    
+    # Показываем, что обрабатываем
+    processing_msg = await update.message.reply_text("⏳ Обрабатываю пост через Gemini...")
+    
+    try:
+        # Получаем текущее время (как будто пост только что опубликован)
+        post_time_kyiv = get_kyiv_time()
+        
+        # Определяем тип сообщения
+        msg_type = await asyncio.to_thread(
+            detect_schedule_message_type,
+            text,
+            post_time_kyiv,
+            "dniproavariyka"  # По умолчанию для тестирования
+        )
+        
+        await processing_msg.edit_text(f"✅ Тип сообщения: <b>{msg_type}</b>", parse_mode=ParseMode.HTML)
+        
+        if msg_type == "ignore":
+            await update.message.reply_text(
+                "🚫 <b>Сообщение проигнорировано</b>\n\n"
+                "Gemini определил это как мусор/рекламу/ЦЕК и т.д.",
+                parse_mode=ParseMode.HTML
+            )
+            return ConversationHandler.END
+        
+        # Определяем день
+        if "today" in msg_type:
+            target_day = "today"
+        else:
+            target_day = "tomorrow"
+        
+        # Получаем город (по умолчанию Днепр для тестирования)
+        cities = db.get_all_cities()
+        city = None
+        for c in cities:
+            if c.name.lower() in ["днепр", "дніпро", "dnipro"]:
+                city = c
+                break
+        
+        if not city:
+            # Если Днепр не найден, берем первый город
+            if cities:
+                city = cities[0]
+            else:
+                await update.message.reply_text(
+                    "❌ <b>Ошибка</b>\n\n"
+                    "В базе данных нет городов. Добавьте город через интерфейс бота.",
+                    parse_mode=ParseMode.HTML
+                )
+                return ConversationHandler.END
+        
+        # Получаем старый график
+        old_schedule = db.get_schedule(city.id, target_day) or {}
+        
+        # Форматируем старый график для отправки
+        old_schedule_text = format_schedule_for_admin(old_schedule, city.name, target_day, "ДО")
+        
+        # Отправляем график ДО
+        await update.message.reply_text(
+            old_schedule_text,
+            parse_mode=ParseMode.HTML
+        )
+        
+        # Обрабатываем пост
+        is_dnipro = city.name.lower() in ["днепр", "дніпро", "dnipro"]
+        new_schedule = None
+        
+        if msg_type.startswith("full_"):
+            # Полный график
+            new_schedule = await asyncio.to_thread(analyze_schedule_text, text)
+            if new_schedule:
+                db.save_schedule(city.id, new_schedule, target_day)
+        elif msg_type.startswith("partial_") and is_dnipro:
+            # Частичное обновление для Днепра
+            new_schedule = await asyncio.to_thread(
+                apply_dnipro_partial_update,
+                old_schedule,
+                text,
+                post_time_kyiv.strftime("%H:%M")
+            )
+            if new_schedule != old_schedule:
+                db.save_schedule(city.id, new_schedule, target_day)
+        else:
+            # Для других городов или случаев
+            schedule_data = await asyncio.to_thread(analyze_schedule_text, text)
+            if schedule_data:
+                if old_schedule:
+                    new_schedule = merge_schedules(old_schedule, schedule_data)
+                else:
+                    new_schedule = schedule_data
+                if new_schedule:
+                    db.save_schedule(city.id, new_schedule, target_day)
+        
+        if new_schedule is None:
+            new_schedule = old_schedule
+        
+        # Форматируем новый график для отправки
+        new_schedule_text = format_schedule_for_admin(new_schedule, city.name, target_day, "ПОСЛЕ")
+        
+        # Отправляем график ПОСЛЕ
+        await update.message.reply_text(
+            new_schedule_text,
+            parse_mode=ParseMode.HTML
+        )
+        
+        # Показываем изменения
+        if old_schedule != new_schedule:
+            changes = get_schedule_changes(old_schedule, new_schedule)
+            if changes:
+                await update.message.reply_text(
+                    f"📊 <b>Изменения:</b>\n\n{changes}",
+                    parse_mode=ParseMode.HTML
+                )
+        else:
+            await update.message.reply_text(
+                "ℹ️ График не изменился."
+            )
+        
+        return ConversationHandler.END
+        
+    except Exception as e:
+        logger.error(f"Ошибка при обработке администраторского поста: {e}", exc_info=True)
+        await update.message.reply_text(
+            f"❌ <b>Ошибка при обработке</b>\n\n"
+            f"Ошибка: {str(e)}",
+            parse_mode=ParseMode.HTML
+        )
+        return ConversationHandler.END
+
+
+def format_schedule_for_admin(schedule: Dict, city_name: str, day: str, prefix: str) -> str:
+    """Форматирует график для отправки администратору"""
+    day_ukr = "сьогодні" if day == "today" else "завтра"
+    
+    if not schedule:
+        return f"📋 <b>{prefix} изменений - График {day_ukr} ({city_name})</b>\n\nГрафик пуст."
+    
+    text = f"📋 <b>{prefix} изменений - График {day_ukr} ({city_name})</b>\n\n"
+    
+    # Сортируем группы
+    groups = sorted([k for k in schedule.keys() if k != '_meta'], key=lambda x: (int(x.split('.')[0]), int(x.split('.')[1])))
+    
+    for group in groups:
+        intervals = schedule[group]
+        if intervals:
+            intervals_str = ", ".join(intervals)
+            text += f"<b>{group}:</b> {intervals_str}\n"
+        else:
+            text += f"<b>{group}:</b> без відключень\n"
+    
+    return text
+
+
+def get_schedule_changes(old_schedule: Dict, new_schedule: Dict) -> str:
+    """Определяет изменения между старым и новым графиком"""
+    changes = []
+    
+    all_groups = set(list(old_schedule.keys()) + list(new_schedule.keys()))
+    all_groups.discard('_meta')
+    
+    for group in sorted(all_groups, key=lambda x: (int(x.split('.')[0]), int(x.split('.')[1]))):
+        old_intervals = old_schedule.get(group, [])
+        new_intervals = new_schedule.get(group, [])
+        
+        if old_intervals != new_intervals:
+            if not old_intervals:
+                changes.append(f"➕ <b>{group}:</b> добавлено {', '.join(new_intervals)}")
+            elif not new_intervals:
+                changes.append(f"➖ <b>{group}:</b> удалено {', '.join(old_intervals)}")
+            else:
+                changes.append(f"🔄 <b>{group}:</b> {', '.join(old_intervals)} → {', '.join(new_intervals)}")
+    
+    return "\n".join(changes) if changes else ""
 
 
 async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2359,50 +2600,23 @@ async def view_schedule_person(update: Update, context: ContextTypes.DEFAULT_TYP
     today_date = current_time.strftime('%d.%m')
     tomorrow_date = (current_time + timedelta(days=1)).strftime('%d.%m')
     
-    # Показываем индикатор загрузки
-    await query.edit_message_text(
-        "⚙️ Формирую ответ...",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⏳ Ожидание...", callback_data="wait")]])
-    )
-    
-    # Генерируем ответ через Gemini (или используем простой формат)
-    # ВАЖНО: Выполняем в отдельном потоке, чтобы не блокировать event loop для других пользователей
+    # Форматируем график без Gemini (как в "График группы")
     try:
-        current_time_str = current_time.strftime('%H:%M')
-        
-        # Сохраняем данные для этого конкретного пользователя в локальные переменные
-        # Это гарантирует, что даже если функция выполняется асинхронно, данные не перемешаются
-        user_person_name = person.name
-        user_city_name = city.name
-        user_group = person.group
-        user_schedule_intervals = schedule_intervals_today or []
-        user_schedule_intervals_tomorrow = schedule_intervals_tomorrow or []
-        user_status_message = status['message']
-        user_next_change = status['nextChange']
-        user_time_to_next = status['timeToNextChange']
-        
-        # Выполняем синхронный вызов Gemini в отдельном потоке
-        import asyncio
-        message = await asyncio.to_thread(
-            generate_schedule_response,
-            user_person_name,
-            user_city_name,
-            user_group,
-            user_schedule_intervals,
-            current_time_str,
-            user_status_message,
-            user_next_change,
-            user_time_to_next,
-            user_schedule_intervals_tomorrow if user_schedule_intervals_tomorrow else None,
-            today_date,
-            tomorrow_date if user_schedule_intervals_tomorrow else None
+        message_block = format_person_schedule_block(
+            person=person,
+            city_name=city.name,
+            schedule_intervals_today=schedule_intervals_today,
+            schedule_intervals_tomorrow=schedule_intervals_tomorrow,
+            current_time=current_time,
+            today_date=today_date,
+            tomorrow_date=tomorrow_date
         )
         
         # Добавляем заголовок
-        full_message = f"📅 <b>График отключений</b>\n\n{message}"
+        full_message = f"📅 <b>График отключений</b>\n\n{message_block}"
         
     except Exception as e:
-        logger.error(f"Ошибка при генерации ответа: {e}")
+        logger.error(f"Ошибка при форматировании графика: {e}", exc_info=True)
         # Fallback на простой формат
         intervals_today_text = ""
         if schedule_intervals_today:
@@ -2412,23 +2626,24 @@ async def view_schedule_person(update: Update, context: ContextTypes.DEFAULT_TYP
         
         full_message = (
             f"📅 <b>График отключений</b>\n\n"
-            f"{status['message']}\n\n"
             f"👤 <b>{person.name}</b> (группа {person.group})\n"
-            f"🏙️ Город: {city.name}\n"
-            f"🕐 Текущее время: {current_time.strftime('%H:%M')}\n\n"
+            f"🏙️ Місто: {city.name}\n\n"
         )
         
         if today_date:
             full_message += f"📅 {today_date}\n"
-        full_message += f"⚡ <b>График відключень на сьогодні:</b>\n{intervals_today_text}\n\n"
+        full_message += f"⚡ Графік відключень на сьогодні:\n{intervals_today_text}\n\n"
         
         if schedule_intervals_tomorrow:
             intervals_tomorrow_text = "\n".join([f"• {interval}" for interval in schedule_intervals_tomorrow])
             if tomorrow_date:
                 full_message += f"📅 {tomorrow_date}\n"
-            full_message += f"⚡ <b>График відключень на завтра:</b>\n{intervals_tomorrow_text}\n\n"
+            full_message += f"⚡ Графік відключень на завтра:\n{intervals_tomorrow_text}\n\n"
         
+        current_time_str = current_time.strftime('%H:%M')
         full_message += (
+            f"🕐 Поточний час: {current_time_str}\n\n"
+            f"{status['message']}\n"
             f"{status['nextChange']}\n"
             f"{status['timeToNextChange']}"
         )
@@ -3209,6 +3424,22 @@ def main():
     )
     application.add_handler(upload_schedule_conv)
     
+    # ConversationHandler для панели администратора
+    admin_post_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("admin", admin_test_post),
+            CommandHandler("test_post", admin_test_post),
+        ],
+        states={
+            WAITING_ADMIN_POST: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_admin_post)],
+        },
+        fallbacks=[
+            CommandHandler("start", start),
+            CommandHandler("cancel", start),
+        ],
+    )
+    application.add_handler(admin_post_conv)
+    
     # Обработчики просмотра графика
     application.add_handler(CallbackQueryHandler(view_schedule_start, pattern="^view_schedule$"))
     application.add_handler(CallbackQueryHandler(view_schedule_city, pattern="^view_schedule_city_"))
@@ -3286,12 +3517,13 @@ def main():
             """Проверяет периодически, работает ли мониторинг, и перезапускает если нет"""
             import time
             # Интервал проверки в секундах (по умолчанию 60 минут = 3600 секунд)
-            check_interval_minutes = int(os.getenv("MONITORING_CHECK_INTERVAL_MINUTES", "60"))
+            # ИЗМЕНЕНИЕ: Ставим 5 минут (300 секунд) по умолчанию вместо 60 минут
+            check_interval_minutes = int(os.getenv("MONITORING_CHECK_INTERVAL_MINUTES", "5"))
             check_interval = check_interval_minutes * 60
             logger.info(f"⏰ Автоматическая проверка мониторинга будет выполняться каждые {check_interval_minutes} минут")
             
-            # Первая проверка через 5 минут после запуска (чтобы дать время мониторингу запуститься)
-            time.sleep(300)  # 5 минут
+            # Первая проверка через 1 минуту (быстрее обнаружение проблем)
+            time.sleep(60)  # 1 минута
             
             while True:
                 try:

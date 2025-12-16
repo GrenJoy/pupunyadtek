@@ -46,6 +46,7 @@ class ChannelMonitor:
         self._processed_albums_lock = None  # Будет инициализирован в start_monitoring (asyncio.Lock нельзя создать в __init__)
         self._processing_messages = set()  # Отслеживание сообщений, которые сейчас обрабатываются (защита от повторной обработки)
         self._processing_lock = None  # Lock для защиты от параллельной обработки одного поста
+        self._initial_check_done = False  # Флаг: была ли выполнена первичная проверка последних постов
         
         if not API_ID or not API_HASH:
             logger.warning("TELEGRAM_API_ID и TELEGRAM_API_HASH не установлены. Мониторинг канала недоступен.")
@@ -857,7 +858,7 @@ class ChannelMonitor:
             return None
     
     async def start_monitoring(self):
-        """Запускает мониторинг всех каналов из базы данных"""
+        """Запускает мониторинг всех каналов из базы данных с вечным реконнектом"""
         if not API_ID or not API_HASH:
             logger.error("API_ID и API_HASH не установлены. Мониторинг недоступен.")
             return
@@ -865,453 +866,479 @@ class ChannelMonitor:
         if self.is_running:
             logger.warning("Мониторинг уже запущен")
             return
+
+        self.is_running = True
         
-        try:
-            # Создаём клиент с сессией
-            if SESSION_STRING:
-                logger.info("🔑 Использую StringSession из переменной окружения")
-                session = StringSession(SESSION_STRING)
-            else:
-                logger.info("🔑 Использую файл сессии channel_monitor.session")
-                session = 'channel_monitor'
-            
-            self.client = TelegramClient(session, API_ID, API_HASH)
-            
-            # Подключаемся
-            await self.client.connect()
-            
-            # Проверяем авторизацию
-            if not await self.client.is_user_authorized():
-                logger.error("=" * 50)
-                logger.error("❌ ОШИБКА АВТОРИЗАЦИИ!")
-                logger.error("=" * 50)
-                logger.error("Telegram клиент не авторизован!")
-                logger.error("💡 Решение:")
-                logger.error("   1. Запустите: python generate_session.py")
-                logger.error("   2. Или добавьте TELEGRAM_SESSION_STRING в .env файл")
-                logger.error("=" * 50)
-                await self.client.disconnect()
-                self.is_running = False
-                return
-            
-            logger.info("=" * 50)
-            logger.info("🤖 МОНИТОРИНГ КАНАЛОВ ЗАПУЩЕН")
-            logger.info("=" * 50)
-            logger.info(f"✅ Telegram клиент авторизован")
-            
-            # Список заблокированных каналов (не мониторятся)
-            BLOCKED_CHANNELS = ["dtek_ua"]
-            
-            # Получаем все каналы из базы данных
-            channels = self.db.get_all_channels()
-            
-            # Если каналов нет в БД, сообщаем пользователю
-            if not channels:
-                logger.warning("=" * 60)
-                logger.warning("⚠️ В базе данных нет каналов для мониторинга!")
-                logger.warning("=" * 60)
-                logger.info("💡 Добавьте каналы через интерфейс бота:")
-                logger.info("   1. Управление городами → Выберите город → Управление каналом → Добавить канал")
-                logger.info("   2. Или используйте скрипт миграции: python migrate_channels.py")
-                logger.warning("=" * 60)
-                await self.client.disconnect()
-                self.is_running = False
-                return
-            
-            # Фильтруем заблокированные каналы
-            channels_to_monitor = []
-            for ch in channels:
-                if ch.channel_username.lower() not in [blocked.lower() for blocked in BLOCKED_CHANNELS]:
-                    channels_to_monitor.append(ch.channel_username)
+        # ВЕЧНЫЙ ЦИКЛ ПЕРЕПОДКЛЮЧЕНИЯ
+        while self.is_running:
+            try:
+                # Создаём клиент с сессией
+                if SESSION_STRING:
+                    logger.info("🔑 Использую StringSession из переменной окружения")
+                    session = StringSession(SESSION_STRING)
                 else:
-                    logger.warning(f"🚫 Канал @{ch.channel_username} заблокирован и будет пропущен")
+                    logger.info("🔑 Использую файл сессии channel_monitor.session")
+                    session = 'channel_monitor'
+                
+                # connection_retries=None заставляет Telethon пытаться переподключиться вечно
+                self.client = TelegramClient(session, API_ID, API_HASH, connection_retries=None)
+                
+                # Подключаемся
+                await self.client.connect()
+                
+                # Проверяем авторизацию
+                if not await self.client.is_user_authorized():
+                    logger.error("=" * 50)
+                    logger.error("❌ ОШИБКА АВТОРИЗАЦИИ!")
+                    logger.error("=" * 50)
+                    logger.error("Telegram клиент не авторизован!")
+                    logger.error("💡 Решение:")
+                    logger.error("   1. Запустите: python generate_session.py")
+                    logger.error("   2. Или добавьте TELEGRAM_SESSION_STRING в .env файл")
+                    logger.error("=" * 50)
+                    await self.client.disconnect()
+                    self.is_running = False
+                    break
             
-            logger.info(f"📱 Найдено каналов в базе данных: {len(channels)} (активных: {len(channels_to_monitor)})")
-            for ch in channels:
-                city = self.db.get_city(ch.city_id)
-                city_name = city.name if city else f"ID {ch.city_id}"
-                status = "🚫 ЗАБЛОКИРОВАН" if ch.channel_username.lower() in [b.lower() for b in BLOCKED_CHANNELS] else "✅"
-                logger.info(f"   {status} @{ch.channel_username} (город: {city_name})")
+                logger.info("=" * 50)
+                logger.info("🤖 МОНИТОРИНГ ЗАПУЩЕН (RESTART LOOP)")
+                logger.info("=" * 50)
+                logger.info(f"✅ Telegram клиент авторизован")
+                
+                # Инициализируем Lock
+                self._processed_albums_lock = asyncio.Lock()
+                self._processing_lock = asyncio.Lock()
+                
+                # Список заблокированных каналов (не мониторятся)
+                BLOCKED_CHANNELS = ["dtek_ua"]
+                
+                # Получаем все каналы из базы данных
+                channels = self.db.get_all_channels()
             
-            # Проверяем доступ ко всем каналам и сохраняем их ID
-            valid_channels = []
-            monitored_channels_by_id = {}
-            
-            # Создаем карту username -> channel object для удобства
-            username_to_channel = {ch.channel_username.lower(): ch for ch in channels}
-            
-            for channel_username in channels_to_monitor:
-                try:
-                    entity = await self.client.get_entity(channel_username)
-                    valid_channels.append(channel_username)
-                    
-                    # Сохраняем ID канала для надежного определения
-                    if hasattr(entity, 'id'):
-                        ch_obj = username_to_channel.get(channel_username.lower())
-                        if ch_obj:
-                            monitored_channels_by_id[entity.id] = ch_obj
-                            logger.info(f"✅ Доступ к каналу @{channel_username} подтверждён (ID: {entity.id})")
-                        else:
-                             logger.info(f"✅ Доступ к каналу @{channel_username} подтверждён")
+                # Если каналов нет в БД, сообщаем пользователю
+                if not channels:
+                    logger.warning("=" * 60)
+                    logger.warning("⚠️ В базе данных нет каналов для мониторинга!")
+                    logger.warning("=" * 60)
+                    logger.info("💡 Добавьте каналы через интерфейс бота:")
+                    logger.info("   1. Управление городами → Выберите город → Управление каналом → Добавить канал")
+                    logger.info("   2. Или используйте скрипт миграции: python migrate_channels.py")
+                    logger.warning("=" * 60)
+                    await self.client.disconnect()
+                    # Не останавливаем мониторинг, просто ждем и переподключаемся
+                    if self.is_running:
+                        await asyncio.sleep(60)  # Ждем минуту перед повторной попыткой
+                    continue
+                
+                # Фильтруем заблокированные каналы
+                channels_to_monitor = []
+                for ch in channels:
+                    if ch.channel_username.lower() not in [blocked.lower() for blocked in BLOCKED_CHANNELS]:
+                        channels_to_monitor.append(ch.channel_username)
                     else:
-                        logger.info(f"✅ Доступ к каналу @{channel_username} подтверждён")
-                        
-                except Exception as e:
-                    logger.error(f"❌ ОШИБКА: Не удалось получить доступ к каналу @{channel_username}")
-                    logger.error(f"   Ошибка: {e}")
-                    logger.error("💡 Убедитесь, что:")
-                    logger.error("   1. Канал существует и доступен")
-                    logger.error("   2. Ваш аккаунт подписан на канал")
-                    logger.error("   3. Имя канала указано правильно (без @)")
-            
-            if not valid_channels:
-                logger.error("❌ Нет доступных каналов для мониторинга!")
-                await self.client.disconnect()
-                self.is_running = False
-                return
-            
-            logger.info(f"\n📊 Мониторинг {len(valid_channels)} каналов")
-            
-            # Инициализируем Lock для атомарных операций с альбомами
-            self._processed_albums_lock = asyncio.Lock()
-            self._processing_lock = asyncio.Lock()  # Lock для защиты от параллельной обработки одного поста
-            
-            # Создаём словарь для быстрого доступа: channel_username -> city_name
-            # Это позволяет быстро определить город по каналу без запросов к БД
-            channel_to_city_map = {}
-            if channels:  # Только если есть каналы в БД
+                        logger.warning(f"🚫 Канал @{ch.channel_username} заблокирован и будет пропущен")
+                
+                logger.info(f"📱 Найдено каналов в базе данных: {len(channels)} (активных: {len(channels_to_monitor)})")
                 for ch in channels:
                     city = self.db.get_city(ch.city_id)
-                    if city:
-                        channel_to_city_map[ch.channel_username] = city.name
-                        logger.info(f"   📌 @{ch.channel_username} → {city.name}")
-            
-            # Для каждого канала устанавливаем точку отсчёта при первом запуске
-            for channel_username in valid_channels:
-                last_processed_id = self.get_last_message_id(channel_username)
-                if last_processed_id == 0:
+                    city_name = city.name if city else f"ID {ch.city_id}"
+                    status = "🚫 ЗАБЛОКИРОВАН" if ch.channel_username.lower() in [b.lower() for b in BLOCKED_CHANNELS] else "✅"
+                    logger.info(f"   {status} @{ch.channel_username} (город: {city_name})")
+                
+                # Проверяем доступ ко всем каналам и сохраняем их ID
+                valid_channels = []
+                monitored_channels_by_id = {}
+                
+                # Создаем карту username -> channel object для удобства
+                username_to_channel = {ch.channel_username.lower(): ch for ch in channels}
+                
+                for channel_username in channels_to_monitor:
                     try:
-                        latest_messages = await self.client.get_messages(channel_username, limit=1)
+                        entity = await self.client.get_entity(channel_username)
+                        valid_channels.append(channel_username)
+                        
+                        # Сохраняем ID канала для надежного определения
+                        if hasattr(entity, 'id'):
+                            ch_obj = username_to_channel.get(channel_username.lower())
+                            if ch_obj:
+                                monitored_channels_by_id[entity.id] = ch_obj
+                                logger.info(f"✅ Доступ к каналу @{channel_username} подтверждён (ID: {entity.id})")
+                            else:
+                                 logger.info(f"✅ Доступ к каналу @{channel_username} подтверждён")
+                        else:
+                            logger.info(f"✅ Доступ к каналу @{channel_username} подтверждён")
+                            
+                    except Exception as e:
+                        logger.error(f"❌ ОШИБКА: Не удалось получить доступ к каналу @{channel_username}")
+                        logger.error(f"   Ошибка: {e}")
+                        logger.error("💡 Убедитесь, что:")
+                        logger.error("   1. Канал существует и доступен")
+                        logger.error("   2. Ваш аккаунт подписан на канал")
+                        logger.error("   3. Имя канала указано правильно (без @)")
+                
+                if not valid_channels:
+                    logger.error("❌ Нет доступных каналов для мониторинга!")
+                    await self.client.disconnect()
+                    # Не останавливаем мониторинг, просто ждем и переподключаемся
+                    if self.is_running:
+                        await asyncio.sleep(60)  # Ждем минуту перед повторной попыткой
+                    continue
+                
+                logger.info(f"\n📊 Мониторинг {len(valid_channels)} каналов")
+                
+                # Инициализируем Lock для атомарных операций с альбомами (если еще не инициализированы)
+                if self._processed_albums_lock is None:
+                    self._processed_albums_lock = asyncio.Lock()
+                if self._processing_lock is None:
+                    self._processing_lock = asyncio.Lock()  # Lock для защиты от параллельной обработки одного поста
+                
+                # Создаём словарь для быстрого доступа: channel_username -> city_name
+                # Это позволяет быстро определить город по каналу без запросов к БД
+                channel_to_city_map = {}
+                if channels:  # Только если есть каналы в БД
+                    for ch in channels:
+                        city = self.db.get_city(ch.city_id)
+                        if city:
+                            channel_to_city_map[ch.channel_username] = city.name
+                            logger.info(f"   📌 @{ch.channel_username} → {city.name}")
+                
+                # ВАЖНО: Проверка последних постов выполняется ТОЛЬКО при первом запуске мониторинга
+                # При переподключении полагаемся только на обработчик событий events.NewMessage(),
+                # который уже имеет защиту от повторной обработки через last_processed_id
+                if not self._initial_check_done:
+                    logger.info("🔍 Первый запуск: проверяю последние посты в каналах...")
+                    
+                    # Для каждого канала устанавливаем точку отсчёта при первом запуске
+                    for channel_username in valid_channels:
+                        last_processed_id = self.get_last_message_id(channel_username)
+                        if last_processed_id == 0:
+                            try:
+                                latest_messages = await self.client.get_messages(channel_username, limit=1)
+                                if latest_messages:
+                                    latest_id = latest_messages[0].id
+                                    self.save_last_message_id(latest_id, channel_username)
+                                    logger.info(f"🆕 Точка отсчёта для @{channel_username}: ID {latest_id}")
+                            except Exception as e:
+                                logger.warning(f"⚠️ Не удалось установить точку отсчёта для @{channel_username}: {e}")
+                    
+                    # ВАЖНО: При первом запуске проверяем последние посты во всех каналах
+                    # Обрабатываем только последние 5 постов для каждого канала (защита от массовой обработки)
+                    for channel_username in valid_channels:
+                        try:
+                        last_processed_id = self.get_last_message_id(channel_username)
+                        latest_messages = await self.client.get_messages(channel_username, limit=5)
+                        
                         if latest_messages:
                             latest_id = latest_messages[0].id
-                            self.save_last_message_id(latest_id, channel_username)
-                            logger.info(f"🆕 Точка отсчёта для @{channel_username}: ID {latest_id}")
-                    except Exception as e:
-                        logger.warning(f"⚠️ Не удалось установить точку отсчёта для @{channel_username}: {e}")
-            
-            # ВАЖНО: При запуске проверяем последние посты во всех каналах
-            # Обрабатываем только последние 5 постов для каждого канала (защита от массовой обработки)
-            for channel_username in valid_channels:
-                try:
-                    last_processed_id = self.get_last_message_id(channel_username)
-                    latest_messages = await self.client.get_messages(channel_username, limit=5)
-                    
-                    if latest_messages:
-                        latest_id = latest_messages[0].id
-                        logger.info(f"📊 Канал @{channel_username}: последний пост ID {latest_id}")
-                        
-                        if last_processed_id > 0:
-                            logger.info(f"📝 Канал @{channel_username}: последний обработанный пост ID {last_processed_id}")
+                            logger.info(f"📊 Канал @{channel_username}: последний пост ID {latest_id}")
                             
-                            # Проверяем, есть ли необработанные посты
-                            if latest_id > last_processed_id:
-                                logger.info(f"🆕 Канал @{channel_username}: найдены необработанные посты! Проверяю последние 5...")
-                                processed_count = 0
-                                for msg in reversed(latest_messages):
-                                    if msg.id > last_processed_id:
-                                        # Извлекаем текст
-                                        text = (
-                                            msg.text or 
-                                            getattr(msg, 'message', None) or 
-                                            getattr(msg, 'raw_text', None) or 
-                                            ""
-                                        )
-                                        
-                                        logger.info(f"\n{'='*60}")
-                                        logger.info(f"📩 ПРОВЕРКА ПОСТА ПРИ ЗАПУСКЕ (@{channel_username})")
-                                        logger.info(f"{'='*60}")
-                                        logger.info(f"   📌 ID: {msg.id}")
-                                        logger.info(f"   📅 Время: {msg.date.strftime('%Y-%m-%d %H:%M:%S') if msg.date else 'Неизвестно'}")
-                                        logger.info(f"   📝 Текст: {text[:200] if text else 'Нет текста'}...")
-                                        
-                                        # Проверяем наличие фото
-                                        has_photo = msg.photo or (hasattr(msg, 'grouped_id') and msg.grouped_id)
-                                        
-                                        if has_photo:
-                                            schedule_type = None  # Fix UnboundLocalError
-                                            logger.info(f"   📸 Обнаружены фотографии, начинаю обработку...")
-                                            logger.info(f"   🤖 Отправляю фото в Gemini Vision для анализа...")
-                                            success = await self.download_and_process_photos(msg, channel_to_city_map)
-                                            if success:
-                                                logger.info(f"   ✅ Пост ID {msg.id} обработан!")
-                                        elif text and len(text.strip()) > 0:
-                                            # Нет фото, но есть текст - проверяем через Gemini
-                                            from gemini_service import check_schedule_post_and_date, analyze_schedule_text
-                                            
-                                            # Проверяем через Gemini (выполняем в отдельном потоке)
-                                            # Используем новую функцию, которая сразу определяет и график, и дату
-                                            schedule_type = await asyncio.to_thread(check_schedule_post_and_date, text)
-                                            if schedule_type:
-                                                schedule_data = await asyncio.to_thread(analyze_schedule_text, text)
-                                                if schedule_data and len(schedule_data) > 0:
-                                                    # Определяем город и сохраняем
-                                                    city_name = None
-                                                    if channel_to_city_map:
-                                                        city_name = channel_to_city_map.get(channel_username)
-                                                    
-                                                    if not city_name:
-                                                        city_name = self.extract_city_from_text(text)
-                                                    
-                                                    if not city_name:
-                                                        cities = self.db.get_cities()
-                                                        city_name = cities[0].name if cities else "Днепр"
-                                                    
-                                                    cities = self.db.get_cities()
-                                                    city = next((c for c in cities if c.name.lower() == city_name.lower()), None)
-                                                    
-                                                    if not city:
-                                                        try:
-                                                            city_id = self.db.add_city(city_name)
-                                                            city = self.db.get_city(city_id)
-                                                        except:
-                                                            city = None
-                                                    
-                                                    if city:
-                                                        old_schedule = self.db.get_schedule(city.id, schedule_type) or {}
-                                                        from gemini_service import is_complete_schedule, merge_schedules
-                                                        
-                                                        if is_complete_schedule(schedule_data, old_schedule):
-                                                            self.db.save_schedule(city.id, schedule_data, schedule_type)
-                                                        else:
-                                                            if old_schedule:
-                                                                merged_schedule = merge_schedules(old_schedule, schedule_data)
-                                                                self.db.save_schedule(city.id, merged_schedule, schedule_type)
-                                                            else:
-                                                                self.db.save_schedule(city.id, schedule_data, schedule_type)
-                                                        
-                                                        final_groups = len([k for k in (self.db.get_schedule(city.id, schedule_type) or {}).keys() if k != '_meta'])
-                                                        logger.info(f"   ✅ График ({schedule_type}) из текста сохранён для поста ID {msg.id}. Всего групп: {final_groups}")
-                                        
-                                        # Сохраняем ID
-                                        self.save_last_message_id(msg.id, channel_username)
-                                        processed_count += 1
-                                        
-                                        if processed_count >= 5:
-                                            break
-                        else:
-                            # Первый запуск для этого канала - устанавливаем точку отсчёта
-                            self.save_last_message_id(latest_id, channel_username)
-                            logger.info(f"🆕 Канал @{channel_username}: точка отсчёта установлена (ID {latest_id})")
-                except Exception as e:
-                    logger.error(f"⚠️ Ошибка при проверке канала @{channel_username}: {e}")
-            
-            self.is_running = True
-            
-            # Запускаем периодическую очистку старых альбомов
-            asyncio.create_task(self._cleanup_old_albums())
-            
-            # Обработчик новых сообщений для всех каналов
-            # ВАЖНО: Слушаем ВСЕ новые сообщения и фильтруем внутри
-            # Это надежнее, чем фильтр chats=..., который может не сработать если кеш не обновлен
-            @self.client.on(events.NewMessage())
-            async def handler(event):
-                try:
-                    message = event.message
-                    chat_id = event.chat_id
-                    
-                    # Получаем информацию о чате
-                    try:
-                        chat = await event.get_chat()
-                        chat_username = getattr(chat, 'username', None)
-                        chat_title = getattr(chat, 'title', 'Unknown')
-                    except:
-                        chat_username = None
-                        chat_title = "Unknown"
-
-                    # Логируем каждое входящее сообщение для отладки (но коротко)
-                    # logger.info(f"📨 Получено сообщение из: {chat_title} (ID: {chat_id}, @{chat_username})")
-                    
-                    # Проверяем, отслеживаем ли мы этот канал
-                    is_monitored = False
-                    monitored_city_name = None
-                    channel_username_for_message = chat_username
-                    
-                    # Проверяем по username
-                    monitored_channel_obj = None
-                    
-                    # ПРИОРИТЕТ 1: Проверка по ID (самая надежная)
-                    channel_id = None
-                    if hasattr(message.peer_id, 'channel_id'):
-                        channel_id = message.peer_id.channel_id
-                    elif hasattr(message.peer_id, 'chat_id'):
-                        channel_id = message.peer_id.chat_id
-                    elif hasattr(message.peer_id, 'user_id'):
-                        channel_id = message.peer_id.user_id
-                        
-                    if channel_id and channel_id in monitored_channels_by_id:
-                        is_monitored = True
-                        monitored_channel_obj = monitored_channels_by_id[channel_id]
-                        # Находим имя города
-                        city = self.db.get_city(monitored_channel_obj.city_id)
-                        monitored_city_name = city.name if city else "Unknown"
-                        logger.debug(f"✅ Канал определен по ID: {channel_id} -> {monitored_city_name}")
-
-                    # ПРИОРИТЕТ 2: Проверка по username (если по ID не нашли)
-                    if not is_monitored and chat_username:
-                        # ВАЖНО: Получаем актуальный список каналов из БД при каждом сообщении
-                        # Это позволяет подхватывать новые каналы без перезагрузки
-                        current_channels = self.db.get_all_channels()
-                        logger.debug(f"🔍 Проверяю канал @{chat_username} против {len(current_channels)} каналов в БД")
-                        
-                        for channel in current_channels:
-                            if channel.channel_username and chat_username.lower() == channel.channel_username.lower():
-                                is_monitored = True
-                                monitored_channel_obj = channel
-                                # Находим имя города
-                                city = self.db.get_city(channel.city_id)
-                                monitored_city_name = city.name if city else "Unknown"
-                                logger.info(f"✅ Канал @{chat_username} найден в БД (город: {monitored_city_name})")
-                                break
-                    
-                    if not is_monitored:
-                        # Логируем пропущенные сообщения для отладки
-                        # Но только если это действительно канал (не личные сообщения)
-                        if chat_username or (channel_id and channel_id > 0):
-                            logger.debug(f"⏭️ Игнорирую сообщение из неотслеживаемого канала: {chat_title} (ID: {channel_id}, @{chat_username})")
-                            # Показываем список отслеживаемых каналов для отладки
-                            current_channels = self.db.get_all_channels()
-                            if current_channels:
-                                logger.debug(f"   📋 Отслеживаемые каналы: {[ch.channel_username for ch in current_channels]}")
-                        return
-
-                    logger.info(f"\n{'='*60}")
-                    logger.info(f"🔔 НОВЫЙ ПОСТ в отслеживаемом канале!")
-                    logger.info(f"   📺 Канал: {chat_title} (@{chat_username})")
-                    logger.info(f"   🏙️ Город: {monitored_city_name}")
-                    logger.info(f"   📌 ID поста: {message.id}")
-                    logger.info(f"{'='*60}")
-                    
-                    # Получаем последний обработанный ID
-                    last_processed_id = self.get_last_message_id(chat_username) if chat_username else 0
-                    
-                    # КРИТИЧЕСКАЯ ПРОВЕРКА: Пропускаем старые посты
-                    if last_processed_id > 0 and message.id <= last_processed_id:
-                        logger.info(f"⏭️ Пропущен старый пост ID {message.id} (последний обработанный: {last_processed_id})")
-                        return
-                    
-                    # КРИТИЧЕСКАЯ ЗАЩИТА: Проверяем, не обрабатывается ли уже этот пост (защита от повторной обработки)
-                    message_key = f"{chat_username}:{message.id}" if chat_username else f"{chat_id}:{message.id}"
-                    if self._processing_lock is None:
-                        logger.warning("⚠️ Processing lock не инициализирован, пропускаю проверку")
-                    else:
-                        async with self._processing_lock:
-                            if message_key in self._processing_messages:
-                                logger.warning(f"⏭️ Пропущен пост ID {message.id} - уже обрабатывается (защита от повторной обработки)")
-                                return
-                            # Помечаем пост как обрабатываемый
-                            self._processing_messages.add(message_key)
-                            logger.debug(f"🔒 Пост {message.id} помечен как обрабатываемый")
-                    
-                    # ВАЖНО: Для альбомов (grouped_id) обрабатываем только ПЕРВОЕ сообщение
-                    # Используем Lock для атомарности (защита от race condition)
-                    if hasattr(message, 'grouped_id') and message.grouped_id:
-                        # Проверяем, что Lock инициализирован
-                        if self._processed_albums_lock is None:
-                            logger.warning("⚠️ Lock не инициализирован, пропускаю проверку альбома")
-                        else:
-                            async with self._processed_albums_lock:
-                                if message.grouped_id in self._processed_albums:
-                                    logger.debug(f"⏭️ Пропущено сообщение ID {message.id} - альбом {message.grouped_id} уже обрабатывается")
-                                    self.save_last_message_id(message.id, chat_username)
-                                    return
+                            if last_processed_id > 0:
+                                logger.info(f"📝 Канал @{channel_username}: последний обработанный пост ID {last_processed_id}")
                                 
-                                self._processed_albums.add(message.grouped_id)
-                        logger.info(f"📸 Обнаружен альбом {message.grouped_id}, получаю все сообщения...")
+                                # Проверяем, есть ли необработанные посты
+                                if latest_id > last_processed_id:
+                                    logger.info(f"🆕 Канал @{channel_username}: найдены необработанные посты! Проверяю последние 5...")
+                                    processed_count = 0
+                                    for msg in reversed(latest_messages):
+                                        if msg.id > last_processed_id:
+                                            # Извлекаем текст
+                                            text = (
+                                                msg.text or 
+                                                getattr(msg, 'message', None) or 
+                                                getattr(msg, 'raw_text', None) or 
+                                                ""
+                                            )
+                                            
+                                            logger.info(f"\n{'='*60}")
+                                            logger.info(f"📩 ПРОВЕРКА ПОСТА ПРИ ЗАПУСКЕ (@{channel_username})")
+                                            logger.info(f"{'='*60}")
+                                            logger.info(f"   📌 ID: {msg.id}")
+                                            logger.info(f"   📅 Время: {msg.date.strftime('%Y-%m-%d %H:%M:%S') if msg.date else 'Неизвестно'}")
+                                            logger.info(f"   📝 Текст: {text[:200] if text else 'Нет текста'}...")
+                                            
+                                            # Проверяем наличие фото
+                                            has_photo = msg.photo or (hasattr(msg, 'grouped_id') and msg.grouped_id)
+                                            
+                                            if has_photo:
+                                                schedule_type = None  # Fix UnboundLocalError
+                                                logger.info(f"   📸 Обнаружены фотографии, начинаю обработку...")
+                                                logger.info(f"   🤖 Отправляю фото в Gemini Vision для анализа...")
+                                                success = await self.download_and_process_photos(msg, channel_to_city_map)
+                                                if success:
+                                                    logger.info(f"   ✅ Пост ID {msg.id} обработан!")
+                                            elif text and len(text.strip()) > 0:
+                                                # Нет фото, но есть текст - проверяем через Gemini
+                                                from gemini_service import check_schedule_post_and_date, analyze_schedule_text
+                                                
+                                                # Проверяем через Gemini (выполняем в отдельном потоке)
+                                                # Используем новую функцию, которая сразу определяет и график, и дату
+                                                schedule_type = await asyncio.to_thread(check_schedule_post_and_date, text)
+                                                if schedule_type:
+                                                    schedule_data = await asyncio.to_thread(analyze_schedule_text, text)
+                                                    if schedule_data and len(schedule_data) > 0:
+                                                        # Определяем город и сохраняем
+                                                        city_name = None
+                                                        if channel_to_city_map:
+                                                            city_name = channel_to_city_map.get(channel_username)
+                                                        
+                                                        if not city_name:
+                                                            city_name = self.extract_city_from_text(text)
+                                                        
+                                                        if not city_name:
+                                                            cities = self.db.get_cities()
+                                                            city_name = cities[0].name if cities else "Днепр"
+                                                        
+                                                        cities = self.db.get_cities()
+                                                        city = next((c for c in cities if c.name.lower() == city_name.lower()), None)
+                                                        
+                                                        if not city:
+                                                            try:
+                                                                city_id = self.db.add_city(city_name)
+                                                                city = self.db.get_city(city_id)
+                                                            except:
+                                                                city = None
+                                                        
+                                                        if city:
+                                                            old_schedule = self.db.get_schedule(city.id, schedule_type) or {}
+                                                            from gemini_service import is_complete_schedule, merge_schedules
+                                                            
+                                                            if is_complete_schedule(schedule_data, old_schedule):
+                                                                self.db.save_schedule(city.id, schedule_data, schedule_type)
+                                                            else:
+                                                                if old_schedule:
+                                                                    merged_schedule = merge_schedules(old_schedule, schedule_data)
+                                                                    self.db.save_schedule(city.id, merged_schedule, schedule_type)
+                                                                else:
+                                                                    self.db.save_schedule(city.id, schedule_data, schedule_type)
+                                                            
+                                                            final_groups = len([k for k in (self.db.get_schedule(city.id, schedule_type) or {}).keys() if k != '_meta'])
+                                                            logger.info(f"   ✅ График ({schedule_type}) из текста сохранён для поста ID {msg.id}. Всего групп: {final_groups}")
+                                            
+                                            # Сохраняем ID
+                                            self.save_last_message_id(msg.id, channel_username)
+                                            processed_count += 1
+                                            
+                                            if processed_count >= 5:
+                                                break
+                            else:
+                                # Первый запуск для этого канала - устанавливаем точку отсчёта
+                                self.save_last_message_id(latest_id, channel_username)
+                                logger.info(f"🆕 Канал @{channel_username}: точка отсчёта установлена (ID {latest_id})")
+                        except Exception as e:
+                            logger.error(f"⚠️ Ошибка при проверке канала @{channel_username}: {e}")
+                    
+                    # Помечаем, что первичная проверка выполнена
+                    self._initial_check_done = True
+                    logger.info("✅ Первичная проверка последних постов завершена")
+                else:
+                    logger.info("⏭️ Переподключение: пропускаю проверку последних постов (полагаюсь на обработчик событий)")
+                
+                # Запускаем периодическую очистку старых альбомов (только если еще не запущена)
+                if not hasattr(self, '_cleanup_task') or self._cleanup_task.done():
+                    self._cleanup_task = asyncio.create_task(self._cleanup_old_albums())
+                
+                # Обработчик новых сообщений для всех каналов
+                # ВАЖНО: Слушаем ВСЕ новые сообщения и фильтруем внутри
+                # Это надежнее, чем фильтр chats=..., который может не сработать если кеш не обновлен
+                @self.client.on(events.NewMessage())
+                async def handler(event):
+                    try:
+                        message = event.message
+                        chat_id = event.chat_id
                         
-                        # Собираем текст альбома
-                        album_messages = []
-                        album_text = ""
+                        # Получаем информацию о чате
+                        try:
+                            chat = await event.get_chat()
+                            chat_username = getattr(chat, 'username', None)
+                            chat_title = getattr(chat, 'title', 'Unknown')
+                        except:
+                            chat_username = None
+                            chat_title = "Unknown"
+
+                        # Логируем каждое входящее сообщение для отладки (но коротко)
+                        # logger.info(f"📨 Получено сообщение из: {chat_title} (ID: {chat_id}, @{chat_username})")
                         
-                        # ВАЖНО: Увеличиваем диапазон поиска для надёжности
-                        # Альбомы могут приходить не по порядку, поэтому ищем шире
-                        async for msg in self.client.iter_messages(
-                            message.peer_id,
-                            min_id=message.id - 30,
-                            max_id=message.id + 30
-                        ):
-                            if (hasattr(msg, 'grouped_id') and 
-                                msg.grouped_id == message.grouped_id and
-                                msg.photo):  # ВАЖНО: Только сообщения с фото
-                                album_messages.append(msg)
-                                msg_text = (msg.text or getattr(msg, 'message', None) or getattr(msg, 'raw_text', None) or "")
-                                if msg_text and not album_text:
-                                    album_text = msg_text
+                        # Проверяем, отслеживаем ли мы этот канал
+                        is_monitored = False
+                        monitored_city_name = None
+                        channel_username_for_message = chat_username
                         
-                        # Если не нашли все фото в диапазоне, пробуем ещё раз с большим диапазоном
-                        if len(album_messages) < 2:  # Если нашли меньше 2 фото, возможно альбом больше
-                            logger.info(f"   ⚠️ Найдено только {len(album_messages)} фото, расширяю поиск...")
+                        # Проверяем по username
+                        monitored_channel_obj = None
+                        
+                        # ПРИОРИТЕТ 1: Проверка по ID (самая надежная)
+                        channel_id = None
+                        if hasattr(message.peer_id, 'channel_id'):
+                            channel_id = message.peer_id.channel_id
+                        elif hasattr(message.peer_id, 'chat_id'):
+                            channel_id = message.peer_id.chat_id
+                        elif hasattr(message.peer_id, 'user_id'):
+                            channel_id = message.peer_id.user_id
+                            
+                        if channel_id and channel_id in monitored_channels_by_id:
+                            is_monitored = True
+                            monitored_channel_obj = monitored_channels_by_id[channel_id]
+                            # Находим имя города
+                            city = self.db.get_city(monitored_channel_obj.city_id)
+                            monitored_city_name = city.name if city else "Unknown"
+                            logger.debug(f"✅ Канал определен по ID: {channel_id} -> {monitored_city_name}")
+
+                        # ПРИОРИТЕТ 2: Проверка по username (если по ID не нашли)
+                        if not is_monitored and chat_username:
+                            # ВАЖНО: Получаем актуальный список каналов из БД при каждом сообщении
+                            # Это позволяет подхватывать новые каналы без перезагрузки
+                            current_channels = self.db.get_all_channels()
+                            logger.debug(f"🔍 Проверяю канал @{chat_username} против {len(current_channels)} каналов в БД")
+                            
+                            for channel in current_channels:
+                                if channel.channel_username and chat_username.lower() == channel.channel_username.lower():
+                                    is_monitored = True
+                                    monitored_channel_obj = channel
+                                    # Находим имя города
+                                    city = self.db.get_city(channel.city_id)
+                                    monitored_city_name = city.name if city else "Unknown"
+                                    logger.info(f"✅ Канал @{chat_username} найден в БД (город: {monitored_city_name})")
+                                    break
+                        
+                        if not is_monitored:
+                            # Логируем пропущенные сообщения для отладки
+                            # Но только если это действительно канал (не личные сообщения)
+                            if chat_username or (channel_id and channel_id > 0):
+                                logger.debug(f"⏭️ Игнорирую сообщение из неотслеживаемого канала: {chat_title} (ID: {channel_id}, @{chat_username})")
+                                # Показываем список отслеживаемых каналов для отладки
+                                current_channels = self.db.get_all_channels()
+                                if current_channels:
+                                    logger.debug(f"   📋 Отслеживаемые каналы: {[ch.channel_username for ch in current_channels]}")
+                            return
+
+                        logger.info(f"\n{'='*60}")
+                        logger.info(f"🔔 НОВЫЙ ПОСТ в отслеживаемом канале!")
+                        logger.info(f"   📺 Канал: {chat_title} (@{chat_username})")
+                        logger.info(f"   🏙️ Город: {monitored_city_name}")
+                        logger.info(f"   📌 ID поста: {message.id}")
+                        logger.info(f"{'='*60}")
+                        
+                        # Получаем последний обработанный ID
+                        last_processed_id = self.get_last_message_id(chat_username) if chat_username else 0
+                        
+                        # КРИТИЧЕСКАЯ ПРОВЕРКА: Пропускаем старые посты
+                        if last_processed_id > 0 and message.id <= last_processed_id:
+                            logger.info(f"⏭️ Пропущен старый пост ID {message.id} (последний обработанный: {last_processed_id})")
+                            return
+                        
+                        # КРИТИЧЕСКАЯ ЗАЩИТА: Проверяем, не обрабатывается ли уже этот пост (защита от повторной обработки)
+                        message_key = f"{chat_username}:{message.id}" if chat_username else f"{chat_id}:{message.id}"
+                        if self._processing_lock is None:
+                            logger.warning("⚠️ Processing lock не инициализирован, пропускаю проверку")
+                        else:
+                            async with self._processing_lock:
+                                if message_key in self._processing_messages:
+                                    logger.warning(f"⏭️ Пропущен пост ID {message.id} - уже обрабатывается (защита от повторной обработки)")
+                                    return
+                                # Помечаем пост как обрабатываемый
+                                self._processing_messages.add(message_key)
+                                logger.debug(f"🔒 Пост {message.id} помечен как обрабатываемый")
+                        
+                        # ВАЖНО: Для альбомов (grouped_id) обрабатываем только ПЕРВОЕ сообщение
+                        # Используем Lock для атомарности (защита от race condition)
+                        if hasattr(message, 'grouped_id') and message.grouped_id:
+                            # Проверяем, что Lock инициализирован
+                            if self._processed_albums_lock is None:
+                                logger.warning("⚠️ Lock не инициализирован, пропускаю проверку альбома")
+                            else:
+                                async with self._processed_albums_lock:
+                                    if message.grouped_id in self._processed_albums:
+                                        logger.debug(f"⏭️ Пропущено сообщение ID {message.id} - альбом {message.grouped_id} уже обрабатывается")
+                                        self.save_last_message_id(message.id, chat_username)
+                                        return
+                                    
+                                    self._processed_albums.add(message.grouped_id)
+                            logger.info(f"📸 Обнаружен альбом {message.grouped_id}, получаю все сообщения...")
+                            
+                            # Собираем текст альбома
+                            album_messages = []
+                            album_text = ""
+                            
+                            # ВАЖНО: Увеличиваем диапазон поиска для надёжности
+                            # Альбомы могут приходить не по порядку, поэтому ищем шире
                             async for msg in self.client.iter_messages(
                                 message.peer_id,
-                                min_id=message.id - 50,
-                                max_id=message.id + 50
+                                min_id=message.id - 30,
+                                max_id=message.id + 30
                             ):
                                 if (hasattr(msg, 'grouped_id') and 
                                     msg.grouped_id == message.grouped_id and
-                                    msg.photo and
-                                    msg not in album_messages):  # Избегаем дубликатов
+                                    msg.photo):  # ВАЖНО: Только сообщения с фото
                                     album_messages.append(msg)
                                     msg_text = (msg.text or getattr(msg, 'message', None) or getattr(msg, 'raw_text', None) or "")
                                     if msg_text and not album_text:
                                         album_text = msg_text
-                        
-                        logger.info(f"   📊 Найдено {len(album_messages)} фото в альбоме {message.grouped_id}")
-                        
-                        text = album_text
-                        album_messages.sort(key=lambda m: m.id)
-                        message = album_messages[0] if album_messages else message  # Работаем с первым сообщением или исходным
-                        
-                        # Очистка метки альбома будет выполнена периодически (см. _cleanup_old_albums)
-                        
-                    else:
-                        text = (message.text or getattr(message, 'message', None) or getattr(message, 'raw_text', None) or "")
-
-                    logger.info(f"   📌 ID: {message.id}")
-                    logger.info(f"   📝 Текст: {text[:200] if text else 'Нет текста'}...")
-                    
-                    # Получаем реальное время публикации поста и конвертируем в Киев
-                    from datetime import datetime
-                    try:
-                        # message.date в Telethon - это datetime объект (может быть UTC или naive)
-                        if message.date:
-                            if message.date.tzinfo is None:
-                                # Если naive datetime, считаем что это UTC
-                                from datetime import timezone
-                                post_time_utc = message.date.replace(tzinfo=timezone.utc)
-                            else:
-                                post_time_utc = message.date
                             
-                            # Конвертируем в Киев
-                            try:
-                                from zoneinfo import ZoneInfo
-                                kyiv_tz = ZoneInfo("Europe/Kyiv")
-                            except ImportError:
-                                import pytz
-                                kyiv_tz = pytz.timezone("Europe/Kyiv")
+                            # Если не нашли все фото в диапазоне, пробуем ещё раз с большим диапазоном
+                            if len(album_messages) < 2:  # Если нашли меньше 2 фото, возможно альбом больше
+                                logger.info(f"   ⚠️ Найдено только {len(album_messages)} фото, расширяю поиск...")
+                                async for msg in self.client.iter_messages(
+                                    message.peer_id,
+                                    min_id=message.id - 50,
+                                    max_id=message.id + 50
+                                ):
+                                    if (hasattr(msg, 'grouped_id') and 
+                                        msg.grouped_id == message.grouped_id and
+                                        msg.photo and
+                                        msg not in album_messages):  # Избегаем дубликатов
+                                        album_messages.append(msg)
+                                        msg_text = (msg.text or getattr(msg, 'message', None) or getattr(msg, 'raw_text', None) or "")
+                                        if msg_text and not album_text:
+                                            album_text = msg_text
                             
-                            post_time_kyiv = post_time_utc.astimezone(kyiv_tz)
-                            logger.info(f"   📅 Время поста: {post_time_kyiv.strftime('%H:%M %d.%m.%Y')}")
+                            logger.info(f"   📊 Найдено {len(album_messages)} фото в альбоме {message.grouped_id}")
+                            
+                            text = album_text
+                            album_messages.sort(key=lambda m: m.id)
+                            message = album_messages[0] if album_messages else message  # Работаем с первым сообщением или исходным
+                            
+                            # Очистка метки альбома будет выполнена периодически (см. _cleanup_old_albums)
+                            
                         else:
-                            # Fallback на текущее время, если дата не доступна
+                            text = (message.text or getattr(message, 'message', None) or getattr(message, 'raw_text', None) or "")
+
+                        logger.info(f"   📌 ID: {message.id}")
+                        logger.info(f"   📝 Текст: {text[:200] if text else 'Нет текста'}...")
+                        
+                        # Получаем реальное время публикации поста и конвертируем в Киев
+                        from datetime import datetime
+                        try:
+                            # message.date в Telethon - это datetime объект (может быть UTC или naive)
+                            if message.date:
+                                if message.date.tzinfo is None:
+                                    # Если naive datetime, считаем что это UTC
+                                    from datetime import timezone
+                                    post_time_utc = message.date.replace(tzinfo=timezone.utc)
+                                else:
+                                    post_time_utc = message.date
+                                
+                                # Конвертируем в Киев
+                                try:
+                                    from zoneinfo import ZoneInfo
+                                    kyiv_tz = ZoneInfo("Europe/Kyiv")
+                                except ImportError:
+                                    import pytz
+                                    kyiv_tz = pytz.timezone("Europe/Kyiv")
+                                
+                                post_time_kyiv = post_time_utc.astimezone(kyiv_tz)
+                                logger.info(f"   📅 Время поста: {post_time_kyiv.strftime('%H:%M %d.%m.%Y')}")
+                            else:
+                                # Fallback на текущее время, если дата не доступна
+                                post_time_kyiv = get_kyiv_time()
+                                logger.warning(f"   ⚠️ Дата поста недоступна, использую текущее время")
+                        except Exception as e:
+                            logger.warning(f"   ⚠️ Ошибка при получении времени поста: {e}, использую текущее время")
                             post_time_kyiv = get_kyiv_time()
-                            logger.warning(f"   ⚠️ Дата поста недоступна, использую текущее время")
-                    except Exception as e:
-                        logger.warning(f"   ⚠️ Ошибка при получении времени поста: {e}, использую текущее время")
-                        post_time_kyiv = get_kyiv_time()
-                    
-                    # Проверяем наличие фото
-                    has_photo = message.photo or (hasattr(message, 'grouped_id') and message.grouped_id)
-                    
-                    if has_photo:
+                        
+                        # Проверяем наличие фото
+                        has_photo = message.photo or (hasattr(message, 'grouped_id') and message.grouped_id)
+                        
+                        if has_photo:
                             logger.info(f"   📸 Обнаружены фотографии, начинаю обработку...")
                             logger.info(f"   🤖 ШАГ 2: Отправляю фото в Gemini Vision для анализа...")
                             
@@ -1525,213 +1552,229 @@ class ChannelMonitor:
                             else:
                                 logger.warning(f"   ❌ Не удалось извлечь данные из фото")
 
-                    else:
-                        # === НОВАЯ ЛОГИКА: Обработка текстовых постов с определением типа ===
-                        if text and len(text.strip()) > 0:
-                            logger.info(f"   📝 Пост без фото, текст ({len(text)} символов) - проверяю через Gemini...")
-                            
-                            # Время поста уже получено выше
-                            
-                            # Определяем тип сообщения (новая универсальная функция)
-                            from gemini_service import detect_schedule_message_type, apply_dnipro_partial_update, analyze_schedule_image, analyze_schedule_text
-                            
-                            msg_type = await asyncio.to_thread(
-                                detect_schedule_message_type,
-                                text,
-                                post_time_kyiv,
-                                chat_username or ""
-                            )
-                            
-                            logger.info(f"   Сообщение: {msg_type} | @{chat_username}")
-                            logger.info(f"   📅 Время поста: {post_time_kyiv.strftime('%H:%M %d.%m.%Y')}")
-                            
-                            if msg_type == "ignore":
-                                logger.info("   Игнорируем (ЦЕК, вода, мусор, авария)")
-                                self.save_last_message_id(message.id, chat_username)
-                                return
-                            
-                            # Определяем день
-                            if "today" in msg_type:
-                                target_day = "today"
-                                logger.info(f"   ✅ Определён как график на СЕГОДНЯ ({target_day})")
-                            else:
-                                target_day = "tomorrow"
-                                logger.info(f"   ✅ Определён как график на ЗАВТРА ({target_day})")
-                            
-                            city = self.db.get_city(monitored_channel_obj.city_id) if monitored_channel_obj else None
-                            if not city:
-                                logger.warning(f"   ⚠️ Город не найден для канала @{chat_username}")
-                                self.save_last_message_id(message.id, chat_username)
-                                return
-                            
-                            old_schedule = self.db.get_schedule(city.id, target_day) or {}
-                            
-                            # Определяем, является ли канал Днепром
-                            is_dnipro = city.name.lower() in ["днепр", "дніпро", "dnipro"] or \
-                                        (chat_username and "dniproavariyka" in chat_username.lower())
-                            
-                            # === ПОЛНЫЙ ГРАФИК (фото или длинный текст) ===
-                            if msg_type.startswith("full_"):
-                                logger.info(f"   Полный график → {target_day}")
-                                logger.info(f"   🔄 ПОЛНАЯ ЗАМЕНА: старый график будет полностью заменён новым (не объединение!)")
-                                logger.info(f"   📊 Старый график: {len(old_schedule)} групп, новый график будет извлечён из текста")
+                        else:
+                            # === НОВАЯ ЛОГИКА: Обработка текстовых постов с определением типа ===
+                            if text and len(text.strip()) > 0:
+                                logger.info(f"   📝 Пост без фото, текст ({len(text)} символов) - проверяю через Gemini...")
                                 
-                                schedule_data = await asyncio.to_thread(analyze_schedule_text, text)
+                                # Время поста уже получено выше
                                 
-                                # КРИТИЧЕСКИ ВАЖНЫЙ FALLBACK: Если график слишком маленький (<6 групп) - это подозрительно!
-                                # Скорее всего это частичное обновление, которое ошибочно классифицировано как full
-                                if schedule_data and len(schedule_data) < 6:
-                                    logger.warning(f"   ⚠️ ПОДОЗРИТЕЛЬНО: График имеет только {len(schedule_data)} групп (ожидалось ≥6)")
-                                    logger.warning(f"   ⚠️ Это может быть частичное обновление, ошибочно классифицированное как full!")
-                                    
-                                    # Если это Днепр - используем частичное обновление
-                                    if is_dnipro:
-                                        logger.info(f"   🔄 FALLBACK: Принудительно трактуем как partial_today и объединяем со старым графиком")
-                                        new_schedule = await asyncio.to_thread(
-                                            apply_dnipro_partial_update,
-                                            old_schedule,
-                                            text,
-                                            post_time_kyiv.strftime("%H:%M")
-                                        )
-                                        if new_schedule != old_schedule:
-                                            self.db.save_schedule(city.id, new_schedule, target_day)
-                                            await self._notify_subscribers_about_changes(
-                                                city.id, city.name, old_schedule, new_schedule, target_day
-                                            )
-                                    else:
-                                        # Для других городов - объединяем через merge_schedules
-                                        logger.info(f"   🔄 FALLBACK: Объединяем со старым графиком через merge_schedules")
-                                        from gemini_service import merge_schedules
-                                        if old_schedule:
-                                            merged_schedule = merge_schedules(old_schedule, schedule_data)
-                                            self.db.save_schedule(city.id, merged_schedule, target_day)
-                                            await self._notify_subscribers_about_changes(
-                                                city.id, city.name, old_schedule, merged_schedule, target_day
-                                            )
-                                        else:
-                                            # Если старого графика нет - сохраняем как есть
-                                            self.db.save_schedule(city.id, schedule_data, target_day)
-                                            await self._notify_subscribers_about_changes(
-                                                city.id, city.name, old_schedule or {}, schedule_data, target_day
-                                            )
-                                elif schedule_data and len(schedule_data) >= 6:
-                                    logger.info(f"   📊 Новый график: {len(schedule_data)} групп - ПОЛНОСТЬЮ заменяет старый")
-                                    self.db.save_schedule(city.id, schedule_data, target_day)
-                                    await self._notify_subscribers_about_changes(
-                                        city.id, city.name, old_schedule, schedule_data, target_day
-                                    )
-                                else:
-                                    logger.warning(f"   ⚠️ Не удалось извлечь график из текста")
-                            
-                            # === ЧАСТИЧНОЕ ОБНОВЛЕНИЕ — ТОЛЬКО ДНЕПР ===
-                            elif msg_type.startswith("partial_") and is_dnipro:
-                                logger.info(f"   Частичное обновление Днепра → {target_day}")
-                                new_schedule = await asyncio.to_thread(
-                                    apply_dnipro_partial_update,
-                                    old_schedule,
+                                # Определяем тип сообщения (новая универсальная функция)
+                                from gemini_service import detect_schedule_message_type, apply_dnipro_partial_update, analyze_schedule_image, analyze_schedule_text
+                                
+                                msg_type = await asyncio.to_thread(
+                                    detect_schedule_message_type,
                                     text,
-                                    post_time_kyiv.strftime("%H:%M")
+                                    post_time_kyiv,
+                                    chat_username or ""
                                 )
-                                if new_schedule != old_schedule:
-                                    self.db.save_schedule(city.id, new_schedule, target_day)
-                                    await self._notify_subscribers_about_changes(
-                                        city.id, city.name, old_schedule, new_schedule, target_day
-                                    )
-                            
-                            # === ОБРАБОТКА ДЛЯ ДРУГИХ ГОРОДОВ (не Днепр) ===
-                            else:
-                                logger.info(f"   Обработка для других городов (не Днепр)")
-                                # Для других городов используем старую логику, но через новую функцию определения типа
-                                from gemini_service import analyze_schedule_text, is_complete_schedule, merge_schedules
                                 
-                                # Преобразуем новый тип в старый формат для совместимости
-                                if msg_type.startswith("full_"):
-                                    schedule_type = target_day
-                                elif msg_type.startswith("partial_"):
-                                    # Для частичных обновлений других городов используем merge_schedules
-                                    schedule_type = target_day
+                                logger.info(f"   Сообщение: {msg_type} | @{chat_username}")
+                                logger.info(f"   📅 Время поста: {post_time_kyiv.strftime('%H:%M %d.%m.%Y')}")
+                                
+                                if msg_type == "ignore":
+                                    logger.info("   Игнорируем (ЦЕК, вода, мусор, авария)")
+                                    self.save_last_message_id(message.id, chat_username)
+                                    return
+                                
+                                # Определяем день
+                                if "today" in msg_type:
+                                    target_day = "today"
+                                    logger.info(f"   ✅ Определён как график на СЕГОДНЯ ({target_day})")
                                 else:
-                                    schedule_type = None
+                                    target_day = "tomorrow"
+                                    logger.info(f"   ✅ Определён как график на ЗАВТРА ({target_day})")
                                 
-                                if schedule_type:
-                                    logger.info(f"   ✅ Это график отключений ({schedule_type})!")
+                                city = self.db.get_city(monitored_channel_obj.city_id) if monitored_channel_obj else None
+                                if not city:
+                                    logger.warning(f"   ⚠️ Город не найден для канала @{chat_username}")
+                                    self.save_last_message_id(message.id, chat_username)
+                                    return
+                                
+                                old_schedule = self.db.get_schedule(city.id, target_day) or {}
+                                
+                                # Определяем, является ли канал Днепром
+                                is_dnipro = city.name.lower() in ["днепр", "дніпро", "dnipro"] or \
+                                            (chat_username and "dniproavariyka" in chat_username.lower())
+                                
+                                # === ПОЛНЫЙ ГРАФИК (фото или длинный текст) ===
+                                if msg_type.startswith("full_"):
+                                    logger.info(f"   Полный график → {target_day}")
+                                    logger.info(f"   🔄 ПОЛНАЯ ЗАМЕНА: старый график будет полностью заменён новым (не объединение!)")
+                                    logger.info(f"   📊 Старый график: {len(old_schedule)} групп, новый график будет извлечён из текста")
+                                    
                                     schedule_data = await asyncio.to_thread(analyze_schedule_text, text)
-                                    if schedule_data and len(schedule_data) > 0:
-                                        groups_list = list(schedule_data.keys())
-                                        logger.info(f"   ✅ Gemini извлёк данные: {len(schedule_data)} групп - {groups_list}")
+                                    
+                                    # КРИТИЧЕСКИ ВАЖНЫЙ FALLBACK: Если график слишком маленький (<6 групп) - это подозрительно!
+                                    # Скорее всего это частичное обновление, которое ошибочно классифицировано как full
+                                    if schedule_data and len(schedule_data) < 6:
+                                        logger.warning(f"   ⚠️ ПОДОЗРИТЕЛЬНО: График имеет только {len(schedule_data)} групп (ожидалось ≥6)")
+                                        logger.warning(f"   ⚠️ Это может быть частичное обновление, ошибочно классифицированное как full!")
                                         
-                                        # КРИТИЧЕСКИ ВАЖНО: Если это full_* тип, то ПОЛНОСТЬЮ заменяем, не объединяем!
-                                        if msg_type.startswith("full_"):
-                                            logger.info(f"   🔄 ПОЛНАЯ ЗАМЕНА для других городов: старый график будет полностью заменён новым")
-                                            logger.info(f"   📊 Старый график: {len(old_schedule)} групп, новый график: {len(schedule_data)} групп")
-                                            self.db.save_schedule(city.id, schedule_data, schedule_type)
-                                            final_schedule = schedule_data
-                                        elif is_complete_schedule(schedule_data, old_schedule):
-                                            # Если график полный (но не определён как full_*), тоже заменяем полностью
-                                            logger.info(f"   🔄 Полный график (определён через is_complete_schedule): заменяем полностью")
-                                            self.db.save_schedule(city.id, schedule_data, schedule_type)
-                                            final_schedule = schedule_data
+                                        # Если это Днепр - используем частичное обновление
+                                        if is_dnipro:
+                                            logger.info(f"   🔄 FALLBACK: Принудительно трактуем как partial_today и объединяем со старым графиком")
+                                            new_schedule = await asyncio.to_thread(
+                                                apply_dnipro_partial_update,
+                                                old_schedule,
+                                                text,
+                                                post_time_kyiv.strftime("%H:%M")
+                                            )
+                                            if new_schedule != old_schedule:
+                                                self.db.save_schedule(city.id, new_schedule, target_day)
+                                                await self._notify_subscribers_about_changes(
+                                                    city.id, city.name, old_schedule, new_schedule, target_day
+                                                )
                                         else:
-                                            # Только для частичных обновлений объединяем
-                                            logger.info(f"   🔄 Частичное обновление: объединяем со старым графиком")
+                                            # Для других городов - объединяем через merge_schedules
+                                            logger.info(f"   🔄 FALLBACK: Объединяем со старым графиком через merge_schedules")
+                                            from gemini_service import merge_schedules
                                             if old_schedule:
                                                 merged_schedule = merge_schedules(old_schedule, schedule_data)
-                                                self.db.save_schedule(city.id, merged_schedule, schedule_type)
-                                                final_schedule = merged_schedule
+                                                self.db.save_schedule(city.id, merged_schedule, target_day)
+                                                await self._notify_subscribers_about_changes(
+                                                    city.id, city.name, old_schedule, merged_schedule, target_day
+                                                )
                                             else:
+                                                # Если старого графика нет - сохраняем как есть
+                                                self.db.save_schedule(city.id, schedule_data, target_day)
+                                                await self._notify_subscribers_about_changes(
+                                                    city.id, city.name, old_schedule or {}, schedule_data, target_day
+                                                )
+                                    elif schedule_data and len(schedule_data) >= 6:
+                                        logger.info(f"   📊 Новый график: {len(schedule_data)} групп - ПОЛНОСТЬЮ заменяет старый")
+                                        self.db.save_schedule(city.id, schedule_data, target_day)
+                                        await self._notify_subscribers_about_changes(
+                                            city.id, city.name, old_schedule, schedule_data, target_day
+                                        )
+                                    else:
+                                        logger.warning(f"   ⚠️ Не удалось извлечь график из текста")
+                                
+                                # === ЧАСТИЧНОЕ ОБНОВЛЕНИЕ — ТОЛЬКО ДНЕПР ===
+                                elif msg_type.startswith("partial_") and is_dnipro:
+                                    logger.info(f"   Частичное обновление Днепра → {target_day}")
+                                    new_schedule = await asyncio.to_thread(
+                                        apply_dnipro_partial_update,
+                                        old_schedule,
+                                        text,
+                                        post_time_kyiv.strftime("%H:%M")
+                                    )
+                                    if new_schedule != old_schedule:
+                                        self.db.save_schedule(city.id, new_schedule, target_day)
+                                        await self._notify_subscribers_about_changes(
+                                            city.id, city.name, old_schedule, new_schedule, target_day
+                                        )
+                                
+                                # === ОБРАБОТКА ДЛЯ ДРУГИХ ГОРОДОВ (не Днепр) ===
+                                else:
+                                    logger.info(f"   Обработка для других городов (не Днепр)")
+                                    # Для других городов используем старую логику, но через новую функцию определения типа
+                                    from gemini_service import analyze_schedule_text, is_complete_schedule, merge_schedules
+                                    
+                                    # Преобразуем новый тип в старый формат для совместимости
+                                    if msg_type.startswith("full_"):
+                                        schedule_type = target_day
+                                    elif msg_type.startswith("partial_"):
+                                        # Для частичных обновлений других городов используем merge_schedules
+                                        schedule_type = target_day
+                                    else:
+                                        schedule_type = None
+                                    
+                                    if schedule_type:
+                                        logger.info(f"   ✅ Это график отключений ({schedule_type})!")
+                                        schedule_data = await asyncio.to_thread(analyze_schedule_text, text)
+                                        if schedule_data and len(schedule_data) > 0:
+                                            groups_list = list(schedule_data.keys())
+                                            logger.info(f"   ✅ Gemini извлёк данные: {len(schedule_data)} групп - {groups_list}")
+                                            
+                                            # КРИТИЧЕСКИ ВАЖНО: Если это full_* тип, то ПОЛНОСТЬЮ заменяем, не объединяем!
+                                            if msg_type.startswith("full_"):
+                                                logger.info(f"   🔄 ПОЛНАЯ ЗАМЕНА для других городов: старый график будет полностью заменён новым")
+                                                logger.info(f"   📊 Старый график: {len(old_schedule)} групп, новый график: {len(schedule_data)} групп")
                                                 self.db.save_schedule(city.id, schedule_data, schedule_type)
                                                 final_schedule = schedule_data
-                                        
-                                        logger.info(f"   💾 График ({schedule_type}) из текста сохранен для {city.name}")
-                                        
-                                        # Отправляем уведомление
-                                        await self._notify_subscribers_about_changes(city.id, city.name, old_schedule or {}, final_schedule, schedule_type)
-                                else:
-                                    logger.info("   ❌ Это НЕ график (игнор) - пропускаю пост")
-                        else:
-                            logger.debug(f"   ⏭️ Пост без фото и без текста - пропускаю")
-                    
-                    # ВАЖНО: Сохраняем ID только после полной обработки поста
-                    # Это предотвращает повторную обработку одного и того же поста
-                    if chat_username:
-                        self.save_last_message_id(message.id, chat_username)
-                        logger.debug(f"💾 Сохранён last_message_id={message.id} для канала @{chat_username}")
-                    
-                    # КРИТИЧЕСКИ ВАЖНО: Убираем пост из списка обрабатываемых
-                    # Это гарантирует, что пост будет удален даже при ошибке
-                    message_key = f"{chat_username}:{message.id}" if chat_username else f"{chat_id}:{message.id}"
-                    if self._processing_lock is not None:
-                        async with self._processing_lock:
-                            if message_key in self._processing_messages:
-                                self._processing_messages.remove(message_key)
-                                logger.debug(f"🔓 Пост {message.id} удален из списка обрабатываемых")
+                                            elif is_complete_schedule(schedule_data, old_schedule):
+                                                # Если график полный (но не определён как full_*), тоже заменяем полностью
+                                                logger.info(f"   🔄 Полный график (определён через is_complete_schedule): заменяем полностью")
+                                                self.db.save_schedule(city.id, schedule_data, schedule_type)
+                                                final_schedule = schedule_data
+                                            else:
+                                                # Только для частичных обновлений объединяем
+                                                logger.info(f"   🔄 Частичное обновление: объединяем со старым графиком")
+                                                if old_schedule:
+                                                    merged_schedule = merge_schedules(old_schedule, schedule_data)
+                                                    self.db.save_schedule(city.id, merged_schedule, schedule_type)
+                                                    final_schedule = merged_schedule
+                                                else:
+                                                    self.db.save_schedule(city.id, schedule_data, schedule_type)
+                                                    final_schedule = schedule_data
+                                            
+                                            logger.info(f"   💾 График ({schedule_type}) из текста сохранен для {city.name}")
+                                            
+                                            # Отправляем уведомление
+                                            await self._notify_subscribers_about_changes(city.id, city.name, old_schedule or {}, final_schedule, schedule_type)
+                                    else:
+                                        logger.info("   ❌ Это НЕ график (игнор) - пропускаю пост")
+                            else:
+                                logger.debug(f"   ⏭️ Пост без фото и без текста - пропускаю")
                         
-                except Exception as e:
-                    logger.error(f"❌ Ошибка в обработчике сообщений: {e}", exc_info=True)
-                    # КРИТИЧЕСКИ ВАЖНО: Убираем пост из списка обрабатываемых даже при ошибке
-                    # Это предотвращает блокировку поста навсегда
-                    message_key = f"{chat_username}:{message.id}" if chat_username else f"{chat_id}:{message.id}"
-                    if self._processing_lock is not None:
-                        async with self._processing_lock:
-                            if message_key in self._processing_messages:
-                                self._processing_messages.remove(message_key)
-                                logger.debug(f"🔓 Пост {message.id} удален из списка обрабатываемых (после ошибки)")
+                        # ВАЖНО: Сохраняем ID только после полной обработки поста
+                        # Это предотвращает повторную обработку одного и того же поста
+                        if chat_username:
+                            self.save_last_message_id(message.id, chat_username)
+                            logger.debug(f"💾 Сохранён last_message_id={message.id} для канала @{chat_username}")
+                        
+                        # КРИТИЧЕСКИ ВАЖНО: Убираем пост из списка обрабатываемых
+                        # Это гарантирует, что пост будет удален даже при ошибке
+                        message_key = f"{chat_username}:{message.id}" if chat_username else f"{chat_id}:{message.id}"
+                        if self._processing_lock is not None:
+                            async with self._processing_lock:
+                                if message_key in self._processing_messages:
+                                    self._processing_messages.remove(message_key)
+                                    logger.debug(f"🔓 Пост {message.id} удален из списка обрабатываемых")
+                            
+                        except Exception as e:
+                            logger.error(f"❌ Ошибка в обработчике сообщений: {e}", exc_info=True)
+                            # КРИТИЧЕСКИ ВАЖНО: Убираем пост из списка обрабатываемых даже при ошибке
+                            # Это предотвращает блокировку поста навсегда
+                            try:
+                                message_key = f"{chat_username}:{message.id}" if chat_username else f"{chat_id}:{message.id}"
+                                if self._processing_lock is not None:
+                                    async with self._processing_lock:
+                                        if message_key in self._processing_messages:
+                                            self._processing_messages.remove(message_key)
+                                            logger.debug(f"🔓 Пост {message.id} удален из списка обрабатываемых (после ошибки)")
+                            except:
+                                pass
+                
+                logger.info("\n🔍 Мониторинг активен! Жду новых постов...\n")
+                
+                # Держим клиент запущенным до разрыва
+                await self.client.run_until_disconnected()
+                
+                logger.warning("⚠️ Соединение с Telegram разорвано. Переподключение через 10 секунд...")
+
+            except Exception as e:
+                logger.error(f"❌ Критическая ошибка в цикле мониторинга: {e}", exc_info=True)
+                # Если мы намеренно остановили, выходим
+                if not self.is_running:
+                    break
+                logger.warning("⚠️ Переподключение через 10 секунд...")
             
-            logger.info("\n🔍 Мониторинг активен! Жду новых постов...\n")
-            
-            # Держим клиент запущенным
-            await self.client.run_until_disconnected()
-            
-        except Exception as e:
-            logger.error(f"Ошибка при запуске мониторинга: {e}")
-            self.is_running = False
-        finally:
-            if self.client:
-                try:
-                    await self.client.disconnect()
-                except Exception as e:
-                    logger.warning(f"Ошибка при отключении клиента: {e}")
-            self.is_running = False
+            finally:
+                if self.client:
+                    try:
+                        await self.client.disconnect()
+                    except Exception as e:
+                        logger.warning(f"Ошибка при отключении клиента: {e}")
+                
+                # Пауза перед рестартом, чтобы не спамить в случае циклической ошибки
+                if self.is_running:
+                    await asyncio.sleep(10)
+
+        logger.info("🛑 Мониторинг полностью остановлен (выход из цикла)")
+
+        logger.info("🛑 Мониторинг полностью остановлен (выход из цикла)")
     
     async def _cleanup_old_albums(self):
         """Периодически очищает метки обработанных альбомов"""
