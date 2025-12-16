@@ -1025,105 +1025,105 @@ class ChannelMonitor:
                     # Обрабатываем только последние 5 постов для каждого канала (защита от массовой обработки)
                     for channel_username in valid_channels:
                         try:
-                        last_processed_id = self.get_last_message_id(channel_username)
-                        latest_messages = await self.client.get_messages(channel_username, limit=5)
-                        
-                        if latest_messages:
-                            latest_id = latest_messages[0].id
-                            logger.info(f"📊 Канал @{channel_username}: последний пост ID {latest_id}")
+                            last_processed_id = self.get_last_message_id(channel_username)
+                            latest_messages = await self.client.get_messages(channel_username, limit=5)
                             
-                            if last_processed_id > 0:
-                                logger.info(f"📝 Канал @{channel_username}: последний обработанный пост ID {last_processed_id}")
+                            if latest_messages:
+                                latest_id = latest_messages[0].id
+                                logger.info(f"📊 Канал @{channel_username}: последний пост ID {latest_id}")
                                 
-                                # Проверяем, есть ли необработанные посты
-                                if latest_id > last_processed_id:
-                                    logger.info(f"🆕 Канал @{channel_username}: найдены необработанные посты! Проверяю последние 5...")
-                                    processed_count = 0
-                                    for msg in reversed(latest_messages):
-                                        if msg.id > last_processed_id:
-                                            # Извлекаем текст
-                                            text = (
-                                                msg.text or 
-                                                getattr(msg, 'message', None) or 
-                                                getattr(msg, 'raw_text', None) or 
-                                                ""
-                                            )
-                                            
-                                            logger.info(f"\n{'='*60}")
-                                            logger.info(f"📩 ПРОВЕРКА ПОСТА ПРИ ЗАПУСКЕ (@{channel_username})")
-                                            logger.info(f"{'='*60}")
-                                            logger.info(f"   📌 ID: {msg.id}")
-                                            logger.info(f"   📅 Время: {msg.date.strftime('%Y-%m-%d %H:%M:%S') if msg.date else 'Неизвестно'}")
-                                            logger.info(f"   📝 Текст: {text[:200] if text else 'Нет текста'}...")
-                                            
-                                            # Проверяем наличие фото
-                                            has_photo = msg.photo or (hasattr(msg, 'grouped_id') and msg.grouped_id)
-                                            
-                                            if has_photo:
-                                                schedule_type = None  # Fix UnboundLocalError
-                                                logger.info(f"   📸 Обнаружены фотографии, начинаю обработку...")
-                                                logger.info(f"   🤖 Отправляю фото в Gemini Vision для анализа...")
-                                                success = await self.download_and_process_photos(msg, channel_to_city_map)
-                                                if success:
-                                                    logger.info(f"   ✅ Пост ID {msg.id} обработан!")
-                                            elif text and len(text.strip()) > 0:
-                                                # Нет фото, но есть текст - проверяем через Gemini
-                                                from gemini_service import check_schedule_post_and_date, analyze_schedule_text
+                                if last_processed_id > 0:
+                                    logger.info(f"📝 Канал @{channel_username}: последний обработанный пост ID {last_processed_id}")
+                                    
+                                    # Проверяем, есть ли необработанные посты
+                                    if latest_id > last_processed_id:
+                                        logger.info(f"🆕 Канал @{channel_username}: найдены необработанные посты! Проверяю последние 5...")
+                                        processed_count = 0
+                                        for msg in reversed(latest_messages):
+                                            if msg.id > last_processed_id:
+                                                # Извлекаем текст
+                                                text = (
+                                                    msg.text or 
+                                                    getattr(msg, 'message', None) or 
+                                                    getattr(msg, 'raw_text', None) or 
+                                                    ""
+                                                )
                                                 
-                                                # Проверяем через Gemini (выполняем в отдельном потоке)
-                                                # Используем новую функцию, которая сразу определяет и график, и дату
-                                                schedule_type = await asyncio.to_thread(check_schedule_post_and_date, text)
-                                                if schedule_type:
-                                                    schedule_data = await asyncio.to_thread(analyze_schedule_text, text)
-                                                    if schedule_data and len(schedule_data) > 0:
-                                                        # Определяем город и сохраняем
-                                                        city_name = None
-                                                        if channel_to_city_map:
-                                                            city_name = channel_to_city_map.get(channel_username)
-                                                        
-                                                        if not city_name:
-                                                            city_name = self.extract_city_from_text(text)
-                                                        
-                                                        if not city_name:
+                                                logger.info(f"\n{'='*60}")
+                                                logger.info(f"📩 ПРОВЕРКА ПОСТА ПРИ ЗАПУСКЕ (@{channel_username})")
+                                                logger.info(f"{'='*60}")
+                                                logger.info(f"   📌 ID: {msg.id}")
+                                                logger.info(f"   📅 Время: {msg.date.strftime('%Y-%m-%d %H:%M:%S') if msg.date else 'Неизвестно'}")
+                                                logger.info(f"   📝 Текст: {text[:200] if text else 'Нет текста'}...")
+                                                
+                                                # Проверяем наличие фото
+                                                has_photo = msg.photo or (hasattr(msg, 'grouped_id') and msg.grouped_id)
+                                                
+                                                if has_photo:
+                                                    schedule_type = None  # Fix UnboundLocalError
+                                                    logger.info(f"   📸 Обнаружены фотографии, начинаю обработку...")
+                                                    logger.info(f"   🤖 Отправляю фото в Gemini Vision для анализа...")
+                                                    success = await self.download_and_process_photos(msg, channel_to_city_map)
+                                                    if success:
+                                                        logger.info(f"   ✅ Пост ID {msg.id} обработан!")
+                                                elif text and len(text.strip()) > 0:
+                                                    # Нет фото, но есть текст - проверяем через Gemini
+                                                    from gemini_service import check_schedule_post_and_date, analyze_schedule_text
+                                                    
+                                                    # Проверяем через Gemini (выполняем в отдельном потоке)
+                                                    # Используем новую функцию, которая сразу определяет и график, и дату
+                                                    schedule_type = await asyncio.to_thread(check_schedule_post_and_date, text)
+                                                    if schedule_type:
+                                                        schedule_data = await asyncio.to_thread(analyze_schedule_text, text)
+                                                        if schedule_data and len(schedule_data) > 0:
+                                                            # Определяем город и сохраняем
+                                                            city_name = None
+                                                            if channel_to_city_map:
+                                                                city_name = channel_to_city_map.get(channel_username)
+                                                            
+                                                            if not city_name:
+                                                                city_name = self.extract_city_from_text(text)
+                                                            
+                                                            if not city_name:
+                                                                cities = self.db.get_cities()
+                                                                city_name = cities[0].name if cities else "Днепр"
+                                                            
                                                             cities = self.db.get_cities()
-                                                            city_name = cities[0].name if cities else "Днепр"
-                                                        
-                                                        cities = self.db.get_cities()
-                                                        city = next((c for c in cities if c.name.lower() == city_name.lower()), None)
-                                                        
-                                                        if not city:
-                                                            try:
-                                                                city_id = self.db.add_city(city_name)
-                                                                city = self.db.get_city(city_id)
-                                                            except:
-                                                                city = None
-                                                        
-                                                        if city:
-                                                            old_schedule = self.db.get_schedule(city.id, schedule_type) or {}
-                                                            from gemini_service import is_complete_schedule, merge_schedules
+                                                            city = next((c for c in cities if c.name.lower() == city_name.lower()), None)
                                                             
-                                                            if is_complete_schedule(schedule_data, old_schedule):
-                                                                self.db.save_schedule(city.id, schedule_data, schedule_type)
-                                                            else:
-                                                                if old_schedule:
-                                                                    merged_schedule = merge_schedules(old_schedule, schedule_data)
-                                                                    self.db.save_schedule(city.id, merged_schedule, schedule_type)
-                                                                else:
+                                                            if not city:
+                                                                try:
+                                                                    city_id = self.db.add_city(city_name)
+                                                                    city = self.db.get_city(city_id)
+                                                                except:
+                                                                    city = None
+                                                            
+                                                            if city:
+                                                                old_schedule = self.db.get_schedule(city.id, schedule_type) or {}
+                                                                from gemini_service import is_complete_schedule, merge_schedules
+                                                                
+                                                                if is_complete_schedule(schedule_data, old_schedule):
                                                                     self.db.save_schedule(city.id, schedule_data, schedule_type)
-                                                            
-                                                            final_groups = len([k for k in (self.db.get_schedule(city.id, schedule_type) or {}).keys() if k != '_meta'])
-                                                            logger.info(f"   ✅ График ({schedule_type}) из текста сохранён для поста ID {msg.id}. Всего групп: {final_groups}")
-                                            
-                                            # Сохраняем ID
-                                            self.save_last_message_id(msg.id, channel_username)
-                                            processed_count += 1
-                                            
-                                            if processed_count >= 5:
-                                                break
-                            else:
-                                # Первый запуск для этого канала - устанавливаем точку отсчёта
-                                self.save_last_message_id(latest_id, channel_username)
-                                logger.info(f"🆕 Канал @{channel_username}: точка отсчёта установлена (ID {latest_id})")
+                                                                else:
+                                                                    if old_schedule:
+                                                                        merged_schedule = merge_schedules(old_schedule, schedule_data)
+                                                                        self.db.save_schedule(city.id, merged_schedule, schedule_type)
+                                                                    else:
+                                                                        self.db.save_schedule(city.id, schedule_data, schedule_type)
+                                                                
+                                                                final_groups = len([k for k in (self.db.get_schedule(city.id, schedule_type) or {}).keys() if k != '_meta'])
+                                                                logger.info(f"   ✅ График ({schedule_type}) из текста сохранён для поста ID {msg.id}. Всего групп: {final_groups}")
+                                                
+                                                # Сохраняем ID
+                                                self.save_last_message_id(msg.id, channel_username)
+                                                processed_count += 1
+                                                
+                                                if processed_count >= 5:
+                                                    break
+                                else:
+                                    # Первый запуск для этого канала - устанавливаем точку отсчёта
+                                    self.save_last_message_id(latest_id, channel_username)
+                                    logger.info(f"🆕 Канал @{channel_username}: точка отсчёта установлена (ID {latest_id})")
                         except Exception as e:
                             logger.error(f"⚠️ Ошибка при проверке канала @{channel_username}: {e}")
                     
@@ -1732,20 +1732,20 @@ class ChannelMonitor:
                                 if message_key in self._processing_messages:
                                     self._processing_messages.remove(message_key)
                                     logger.debug(f"🔓 Пост {message.id} удален из списка обрабатываемых")
-                            
-                        except Exception as e:
-                            logger.error(f"❌ Ошибка в обработчике сообщений: {e}", exc_info=True)
-                            # КРИТИЧЕСКИ ВАЖНО: Убираем пост из списка обрабатываемых даже при ошибке
-                            # Это предотвращает блокировку поста навсегда
-                            try:
-                                message_key = f"{chat_username}:{message.id}" if chat_username else f"{chat_id}:{message.id}"
-                                if self._processing_lock is not None:
-                                    async with self._processing_lock:
-                                        if message_key in self._processing_messages:
-                                            self._processing_messages.remove(message_key)
-                                            logger.debug(f"🔓 Пост {message.id} удален из списка обрабатываемых (после ошибки)")
-                            except:
-                                pass
+                    
+                    except Exception as e:
+                        logger.error(f"❌ Ошибка в обработчике сообщений: {e}", exc_info=True)
+                        # КРИТИЧЕСКИ ВАЖНО: Убираем пост из списка обрабатываемых даже при ошибке
+                        # Это предотвращает блокировку поста навсегда
+                        try:
+                            message_key = f"{chat_username}:{message.id}" if chat_username else f"{chat_id}:{message.id}"
+                            if self._processing_lock is not None:
+                                async with self._processing_lock:
+                                    if message_key in self._processing_messages:
+                                        self._processing_messages.remove(message_key)
+                                        logger.debug(f"🔓 Пост {message.id} удален из списка обрабатываемых (после ошибки)")
+                        except:
+                            pass
                 
                 logger.info("\n🔍 Мониторинг активен! Жду новых постов...\n")
                 
