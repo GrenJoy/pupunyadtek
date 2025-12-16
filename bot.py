@@ -54,7 +54,9 @@ logger = logging.getLogger(__name__)
     WAITING_CHANNEL_USERNAME,
     WAITING_EDIT_CITY_NAME,
     WAITING_ADMIN_POST,
-) = range(9)
+    WAITING_ADMIN_CITY,
+    WAITING_ADMIN_CONFIRM,
+) = range(11)
 
 # Инициализация базы данных
 db = Database()
@@ -261,12 +263,74 @@ async def admin_test_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Эта команда доступна только администратору.",
             parse_mode=ParseMode.HTML
         )
-        return
+        return ConversationHandler.END
+    
+    # Получаем список городов
+    cities = db.get_all_cities()
+    
+    if not cities:
+        await update.message.reply_text(
+            "❌ <b>Ошибка</b>\n\n"
+            "В базе данных нет городов. Добавьте город через интерфейс бота.",
+            parse_mode=ParseMode.HTML
+        )
+        return ConversationHandler.END
+    
+    # Создаем кнопки для выбора города
+    keyboard = []
+    for city in cities:
+        keyboard.append([InlineKeyboardButton(
+            f"🏙️ {city.name}",
+            callback_data=f"admin_city_{city.id}"
+        )])
+    
+    keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="admin_cancel")])
     
     await update.message.reply_text(
         "🔧 <b>Панель администратора</b>\n\n"
-        "Отправьте текст поста из канала для тестирования.\n"
-        "Бот обработает его через Gemini и покажет:\n"
+        "Выберите город для тестирования поста:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.HTML
+    )
+    
+    return WAITING_ADMIN_CITY
+
+
+async def admin_select_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает выбор города администратором"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    
+    if not is_admin(user_id):
+        await query.edit_message_text("❌ Доступ запрещен")
+        return ConversationHandler.END
+    
+    if query.data == "admin_cancel":
+        await query.edit_message_text("❌ Отменено")
+        return ConversationHandler.END
+    
+    # Извлекаем ID города из callback_data
+    city_id = int(query.data.split("_")[-1])
+    city = db.get_city(city_id)
+    
+    if not city:
+        await query.edit_message_text("❌ Город не найден")
+        return ConversationHandler.END
+    
+    # Сохраняем выбранный город в context
+    context.user_data['admin_city_id'] = city_id
+    context.user_data['admin_city_name'] = city.name
+    # Инициализируем хранилище для фото
+    context.user_data['admin_photos'] = []
+    context.user_data['admin_photo_mime_types'] = []
+    
+    await query.edit_message_text(
+        f"✅ Выбран город: <b>{city.name}</b>\n\n"
+        "Теперь отправьте текст поста ИЛИ фото (до 3 штук) из канала для тестирования.\n\n"
+        "💡 <b>Важно:</b> Если отправляете несколько фото, они будут обработаны все вместе после нажатия кнопки '✅ Обработать'.\n\n"
+        "Бот обработает через Gemini и покажет:\n"
         "• Тип сообщения (full_today, partial_today, ignore и т.д.)\n"
         "• График ДО изменений\n"
         "• График ПОСЛЕ изменений\n\n"
@@ -277,21 +341,232 @@ async def admin_test_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return WAITING_ADMIN_POST
 
 
+async def admin_process_photos_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает все загруженные фото в админ панели после нажатия 'Обработать'"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    
+    if not is_admin(user_id):
+        await query.edit_message_text("❌ Доступ запрещен")
+        return ConversationHandler.END
+    
+    # Получаем выбранный город
+    city_id = context.user_data.get('admin_city_id')
+    if not city_id:
+        await query.edit_message_text(
+            "❌ <b>Ошибка</b>\n\n"
+            "Город не выбран. Начните заново с команды /admin",
+            parse_mode=ParseMode.HTML
+        )
+        return ConversationHandler.END
+    
+    city = db.get_city(city_id)
+    if not city:
+        await query.edit_message_text("❌ Город не найден")
+        return ConversationHandler.END
+    
+    # Получаем загруженные фото
+    photos_bytes = context.user_data.get('admin_photos', [])
+    mime_types = context.user_data.get('admin_photo_mime_types', [])
+    text = context.user_data.get('admin_text', '')
+    
+    if not photos_bytes:
+        await query.edit_message_text(
+            "⚠️ Не загружено ни одного фото.\n\n"
+            "Отправьте фото или текст поста.",
+            parse_mode=ParseMode.HTML
+        )
+        return WAITING_ADMIN_POST
+    
+    # Показываем, что обрабатываем
+    await query.edit_message_text(f"⏳ Обрабатываю {len(photos_bytes)} фото через Gemini...")
+    
+    try:
+        # Получаем текущее время
+        post_time_kyiv = get_kyiv_time()
+        
+        # Определяем тип сообщения по тексту (если есть)
+        if text and len(text.strip()) >= 10:
+            msg_type = await asyncio.to_thread(
+                detect_schedule_message_type,
+                text,
+                post_time_kyiv,
+                city.name.lower() if "dnipro" in city.name.lower() else ""
+            )
+        else:
+            # Если нет текста, определяем по времени поста
+            current_time = get_kyiv_time()
+            today_date = current_time.date()
+            post_date = post_time_kyiv.date()
+            
+            if post_date == today_date and post_time_kyiv.hour < 12:
+                msg_type = "full_today"
+            else:
+                msg_type = "full_tomorrow"
+        
+        if msg_type == "ignore":
+            await query.edit_message_text(
+                "🚫 <b>Сообщение проигнорировано</b>\n\n"
+                "Gemini определил это как мусор/рекламу/ЦЕК и т.д.",
+                parse_mode=ParseMode.HTML
+            )
+            # Очищаем контекст
+            context.user_data.pop('admin_photos', None)
+            context.user_data.pop('admin_photo_mime_types', None)
+            context.user_data.pop('admin_text', None)
+            return ConversationHandler.END
+        
+        # Определяем день
+        if "today" in msg_type:
+            target_day = "today"
+        else:
+            target_day = "tomorrow"
+        
+        # Получаем старый график
+        old_schedule = db.get_schedule(city.id, target_day) or {}
+        
+        # Форматируем старый график для отправки
+        old_schedule_text = format_schedule_for_admin(old_schedule, city.name, target_day, "ДО")
+        
+        # Отправляем график ДО
+        await query.message.reply_text(
+            old_schedule_text,
+            parse_mode=ParseMode.HTML
+        )
+        
+        # ВАЖНО: Теперь обрабатываем ВСЕ фото через Gemini
+        merged_schedule = {}
+        processed_count = 0
+        
+        for i, (photo_bytes, mime_type) in enumerate(zip(photos_bytes, mime_types), 1):
+            logger.info(f"📸 Админ панель: обрабатываю фото {i}/{len(photos_bytes)} через Gemini...")
+            
+            # Анализируем фото через Gemini
+            schedule_data = await asyncio.to_thread(analyze_schedule_image, photo_bytes, mime_type)
+            
+            if schedule_data:
+                groups_list = list(schedule_data.keys())
+                logger.info(f"   ✅ Фото {i}: распознано {len(schedule_data)} групп - {groups_list}")
+                
+                # Объединяем данные из всех фото
+                merged_schedule.update(schedule_data)
+                processed_count += 1
+        
+        if not merged_schedule:
+            await query.message.reply_text(
+                "❌ <b>Ошибка</b>\n\n"
+                "Не удалось извлечь график ни из одного фото.",
+                parse_mode=ParseMode.HTML
+            )
+            # Очищаем контекст
+            context.user_data.pop('admin_photos', None)
+            context.user_data.pop('admin_photo_mime_types', None)
+            context.user_data.pop('admin_text', None)
+            return ConversationHandler.END
+        
+        # Обрабатываем график
+        is_dnipro = city.name.lower() in ["днепр", "дніпро", "dnipro"]
+        new_schedule = None
+        
+        if msg_type.startswith("full_"):
+            # Полный график - заменяем полностью
+            new_schedule = merged_schedule
+            db.save_schedule(city.id, new_schedule, target_day)
+        elif msg_type.startswith("partial_") and is_dnipro:
+            # Частичное обновление для Днепра
+            from gemini_service import merge_schedules
+            if old_schedule:
+                new_schedule = merge_schedules(old_schedule, merged_schedule)
+            else:
+                new_schedule = merged_schedule
+            if new_schedule:
+                db.save_schedule(city.id, new_schedule, target_day)
+        else:
+            # Для других городов - объединяем
+            from gemini_service import merge_schedules
+            if old_schedule:
+                new_schedule = merge_schedules(old_schedule, merged_schedule)
+            else:
+                new_schedule = merged_schedule
+            if new_schedule:
+                db.save_schedule(city.id, new_schedule, target_day)
+        
+        if new_schedule is None:
+            new_schedule = old_schedule
+        
+        # Форматируем новый график для отправки
+        new_schedule_text = format_schedule_for_admin(new_schedule, city.name, target_day, "ПОСЛЕ")
+        
+        # Отправляем график ПОСЛЕ
+        await query.message.reply_text(
+            new_schedule_text,
+            parse_mode=ParseMode.HTML
+        )
+        
+        # Показываем изменения
+        if old_schedule != new_schedule:
+            changes = get_schedule_changes(old_schedule, new_schedule)
+            if changes:
+                await query.message.reply_text(
+                    f"📊 <b>Изменения:</b>\n\n{changes}\n\n"
+                    f"📸 Обработано фото: {processed_count}/{len(photos_bytes)}",
+                    parse_mode=ParseMode.HTML
+                )
+        else:
+            await query.message.reply_text(
+                f"ℹ️ График не изменился.\n\n"
+                f"📸 Обработано фото: {processed_count}/{len(photos_bytes)}"
+            )
+        
+        # Очищаем контекст
+        context.user_data.pop('admin_photos', None)
+        context.user_data.pop('admin_photo_mime_types', None)
+        context.user_data.pop('admin_text', None)
+        
+        return ConversationHandler.END
+        
+    except Exception as e:
+        logger.error(f"Ошибка при обработке фото в админ панели: {e}", exc_info=True)
+        await query.message.reply_text(
+            f"❌ <b>Ошибка при обработке</b>\n\n"
+            f"Ошибка: {str(e)}",
+            parse_mode=ParseMode.HTML
+        )
+        # Очищаем контекст
+        context.user_data.pop('admin_photos', None)
+        context.user_data.pop('admin_photo_mime_types', None)
+        context.user_data.pop('admin_text', None)
+        return ConversationHandler.END
+
+
 async def process_admin_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает текст поста от администратора"""
+    """Обрабатывает текст или фото поста от администратора"""
     user_id = update.effective_user.id
     
     if not is_admin(user_id):
         await update.message.reply_text("❌ Доступ запрещен")
         return ConversationHandler.END
     
-    text = update.message.text
-    
-    if not text or len(text.strip()) < 10:
+    # Получаем выбранный город из context
+    city_id = context.user_data.get('admin_city_id')
+    if not city_id:
         await update.message.reply_text(
-            "❌ Текст слишком короткий. Отправьте полный текст поста."
+            "❌ <b>Ошибка</b>\n\n"
+            "Город не выбран. Начните заново с команды /admin",
+            parse_mode=ParseMode.HTML
         )
-        return WAITING_ADMIN_POST
+        return ConversationHandler.END
+    
+    city = db.get_city(city_id)
+    if not city:
+        await update.message.reply_text(
+            "❌ <b>Ошибка</b>\n\n"
+            "Город не найден в базе данных.",
+            parse_mode=ParseMode.HTML
+        )
+        return ConversationHandler.END
     
     # Показываем, что обрабатываем
     processing_msg = await update.message.reply_text("⏳ Обрабатываю пост через Gemini...")
@@ -300,12 +575,142 @@ async def process_admin_post(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # Получаем текущее время (как будто пост только что опубликован)
         post_time_kyiv = get_kyiv_time()
         
+        # Проверяем, есть ли фото
+        has_photo = update.message.photo is not None
+        text = update.message.text or update.message.caption or ""
+        
+        if has_photo:
+            # Обработка фото
+            photo_file = await update.message.photo[-1].get_file()
+            buffer = BytesIO()
+            await photo_file.download_to_memory(buffer)
+            photo_bytes = buffer.getvalue()
+            
+            # Определяем тип сообщения по тексту (если есть) или по умолчанию full_today
+            if text and len(text.strip()) >= 10:
+                msg_type = await asyncio.to_thread(
+                    detect_schedule_message_type,
+                    text,
+                    post_time_kyiv,
+                    city.name.lower() if "dnipro" in city.name.lower() else ""
+                )
+            else:
+                # Если нет текста, определяем по времени поста
+                current_time = get_kyiv_time()
+                today_date = current_time.date()
+                post_date = post_time_kyiv.date()
+                
+                if post_date == today_date and post_time_kyiv.hour < 12:
+                    msg_type = "full_today"
+                else:
+                    msg_type = "full_tomorrow"
+            
+            await processing_msg.edit_text(f"✅ Тип сообщения: <b>{msg_type}</b> (фото)", parse_mode=ParseMode.HTML)
+            
+            if msg_type == "ignore":
+                await update.message.reply_text(
+                    "🚫 <b>Сообщение проигнорировано</b>\n\n"
+                    "Gemini определил это как мусор/рекламу/ЦЕК и т.д.",
+                    parse_mode=ParseMode.HTML
+                )
+                return ConversationHandler.END
+            
+            # Определяем день
+            if "today" in msg_type:
+                target_day = "today"
+            else:
+                target_day = "tomorrow"
+            
+            # Получаем старый график
+            old_schedule = db.get_schedule(city.id, target_day) or {}
+            
+            # Форматируем старый график для отправки
+            old_schedule_text = format_schedule_for_admin(old_schedule, city.name, target_day, "ДО")
+            
+            # Отправляем график ДО
+            await update.message.reply_text(
+                old_schedule_text,
+                parse_mode=ParseMode.HTML
+            )
+            
+            # Анализируем фото через Gemini
+            schedule_data = await asyncio.to_thread(analyze_schedule_image, photo_bytes, "image/jpeg")
+            
+            if not schedule_data:
+                await update.message.reply_text(
+                    "❌ <b>Ошибка</b>\n\n"
+                    "Не удалось извлечь график из фото.",
+                    parse_mode=ParseMode.HTML
+                )
+                return ConversationHandler.END
+            
+            # Обрабатываем график
+            is_dnipro = city.name.lower() in ["днепр", "дніпро", "dnipro"]
+            new_schedule = None
+            
+            if msg_type.startswith("full_"):
+                # Полный график - заменяем полностью
+                new_schedule = schedule_data
+                db.save_schedule(city.id, new_schedule, target_day)
+            elif msg_type.startswith("partial_") and is_dnipro:
+                # Частичное обновление для Днепра
+                from gemini_service import merge_schedules
+                if old_schedule:
+                    new_schedule = merge_schedules(old_schedule, schedule_data)
+                else:
+                    new_schedule = schedule_data
+                if new_schedule:
+                    db.save_schedule(city.id, new_schedule, target_day)
+            else:
+                # Для других городов - объединяем
+                from gemini_service import merge_schedules
+                if old_schedule:
+                    new_schedule = merge_schedules(old_schedule, schedule_data)
+                else:
+                    new_schedule = schedule_data
+                if new_schedule:
+                    db.save_schedule(city.id, new_schedule, target_day)
+            
+            if new_schedule is None:
+                new_schedule = old_schedule
+            
+            # Форматируем новый график для отправки
+            new_schedule_text = format_schedule_for_admin(new_schedule, city.name, target_day, "ПОСЛЕ")
+            
+            # Отправляем график ПОСЛЕ
+            await update.message.reply_text(
+                new_schedule_text,
+                parse_mode=ParseMode.HTML
+            )
+            
+            # Показываем изменения
+            if old_schedule != new_schedule:
+                changes = get_schedule_changes(old_schedule, new_schedule)
+                if changes:
+                    await update.message.reply_text(
+                        f"📊 <b>Изменения:</b>\n\n{changes}",
+                        parse_mode=ParseMode.HTML
+                    )
+            else:
+                await update.message.reply_text(
+                    "ℹ️ График не изменился."
+                )
+            
+            return ConversationHandler.END
+        
+        # Обработка текста (если нет фото)
+        if not text or len(text.strip()) < 10:
+            await update.message.reply_text(
+                "❌ Текст слишком короткий. Отправьте полный текст поста или фото."
+            )
+            return WAITING_ADMIN_POST
+        
         # Определяем тип сообщения
         msg_type = await asyncio.to_thread(
             detect_schedule_message_type,
             text,
             post_time_kyiv,
-            "dniproavariyka"  # По умолчанию для тестирования
+            city.name.lower() if "dnipro" in city.name.lower() else ""
         )
         
         await processing_msg.edit_text(f"✅ Тип сообщения: <b>{msg_type}</b>", parse_mode=ParseMode.HTML)
@@ -324,27 +729,7 @@ async def process_admin_post(update: Update, context: ContextTypes.DEFAULT_TYPE)
         else:
             target_day = "tomorrow"
         
-        # Получаем город (по умолчанию Днепр для тестирования)
-        cities = db.get_all_cities()
-        city = None
-        for c in cities:
-            if c.name.lower() in ["днепр", "дніпро", "dnipro"]:
-                city = c
-                break
-        
-        if not city:
-            # Если Днепр не найден, берем первый город
-            if cities:
-                city = cities[0]
-            else:
-                await update.message.reply_text(
-                    "❌ <b>Ошибка</b>\n\n"
-                    "В базе данных нет городов. Добавьте город через интерфейс бота.",
-                    parse_mode=ParseMode.HTML
-                )
-                return ConversationHandler.END
-        
-        # Получаем старый график
+        # Получаем старый график (город уже проверен в начале функции)
         old_schedule = db.get_schedule(city.id, target_day) or {}
         
         # Форматируем старый график для отправки
@@ -1831,15 +2216,18 @@ async def upload_manual_start(update: Update, context: ContextTypes.DEFAULT_TYPE
     if user_id not in user_context:
         user_context[user_id] = {}
     user_context[user_id]["upload_schedule_city_id"] = city_id
-    user_context[user_id]["upload_schedule_photos"] = []
+    user_context[user_id]["upload_schedule_photos"] = []  # Будет хранить байты фото
+    user_context[user_id]["upload_schedule_mime_types"] = []  # Будет хранить MIME типы
     
     city = db.get_city(city_id)
     await query.edit_message_text(
         f"📤 <b>Загрузить свой график</b>\n\n"
         f"Город: <b>{city.name}</b>\n\n"
-        "Отправьте 1-3 фото с графиками отключений ИЛИ текст с графиком.\n"
-        "Бот автоматически распознает их с помощью Gemini AI.",
-        reply_markup=get_back_keyboard(),
+        "Отправьте 1-3 фото с графиками отключений ИЛИ текст с графиком.\n\n"
+        "💡 <b>Важно:</b> Если отправляете несколько фото, они будут обработаны все вместе после нажатия кнопки '✅ Готово'.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Готово", callback_data="upload_schedule_done")
+        ]]),
         parse_mode=ParseMode.HTML
     )
     return WAITING_SCHEDULE_PHOTO
@@ -2168,9 +2556,13 @@ async def handle_schedule_photo(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return ConversationHandler.END
     
-    # Инициализируем список фото, если его нет
+    # Инициализируем список фото (байты), если его нет
     if "upload_schedule_photos" not in user_context[user_id]:
         user_context[user_id]["upload_schedule_photos"] = []
+    
+    # Инициализируем список MIME типов для фото
+    if "upload_schedule_mime_types" not in user_context[user_id]:
+        user_context[user_id]["upload_schedule_mime_types"] = []
     
     city_id = user_context[user_id]["upload_schedule_city_id"]
     city = db.get_city(city_id)
@@ -2180,7 +2572,7 @@ async def handle_schedule_photo(update: Update, context: ContextTypes.DEFAULT_TY
     if photo_count >= 3:
         await update.message.reply_text(
             f"⚠️ Уже загружено максимальное количество фото (3).\n\n"
-            f"Нажмите 'Готово' для завершения загрузки.",
+            f"Нажмите '✅ Готово' для обработки всех фото.",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("✅ Готово", callback_data="upload_schedule_done")
             ]])
@@ -2190,12 +2582,8 @@ async def handle_schedule_photo(update: Update, context: ContextTypes.DEFAULT_TY
     photo = update.message.photo[-1]  # Берем фото наибольшего размера
     file = await context.bot.get_file(photo.file_id)
     
-    # Отправляем сообщение о начале обработки только для первого фото
-    if photo_count == 0:
-        await update.message.reply_text("⚙️ Распознавание графика...")
-    
     try:
-        # Скачиваем фото
+        # Скачиваем фото (НО НЕ ОБРАБАТЫВАЕМ СРАЗУ!)
         photo_bytearray = await file.download_as_bytearray()
         photo_bytes = bytes(photo_bytearray)  # Конвертируем bytearray в bytes
         
@@ -2204,85 +2592,30 @@ async def handle_schedule_photo(update: Update, context: ContextTypes.DEFAULT_TY
         if file.file_path and file.file_path.endswith('.png'):
             mime_type = "image/png"
         
-        # Анализируем фото через Gemini
-        # ВАЖНО: Выполняем в отдельном потоке, чтобы не блокировать event loop для других пользователей
-        import asyncio
-        schedule_data = await asyncio.to_thread(analyze_schedule_image, photo_bytes, mime_type)
+        # ВАЖНО: Сохраняем только байты фото во временное хранилище
+        # Обработка через Gemini будет выполнена только после нажатия "Готово"
+        user_context[user_id]["upload_schedule_photos"].append(photo_bytes)
+        user_context[user_id]["upload_schedule_mime_types"].append(mime_type)
         
-        if not schedule_data:
-            await update.message.reply_text(
-                "⚠️ Не удалось распознать график на этом фото.\n\n"
-                "Попробуйте отправить другое фото или нажмите 'Готово'.",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("✅ Готово", callback_data="upload_schedule_done")
-                ]])
-            )
-            return WAITING_SCHEDULE_PHOTO
-        
-        # Сохраняем распознанные данные фото в контекст
-        user_context[user_id]["upload_schedule_photos"].append(schedule_data)
-        
-        logger.info(f"📸 Фото {len(user_context[user_id]['upload_schedule_photos'])} обработано. Распознано групп: {len(schedule_data)}")
-        if schedule_data:
-            groups_list = list(schedule_data.keys())
-            logger.info(f"   Группы в этом фото: {groups_list}")
-        
-        # Объединяем данные ТОЛЬКО из загруженных фото (не из существующего графика)
-        # Это важно, чтобы новый график полностью заменял старый
-        merged_schedule = {}
-        for photo_schedule in user_context[user_id]["upload_schedule_photos"]:
-            if photo_schedule:  # Проверяем, что данные не пустые
-                merged_schedule.update(photo_schedule)
-                logger.debug(f"   Объединение: добавлено {len(photo_schedule)} групп из фото")
-        
-        # По умолчанию сохраняем как завтра (так как дата не определена из загруженного фото)
-        # Пользователь может указать дату при загрузке, но пока используем завтра
-        schedule_type = "tomorrow"
-        
-        # Получаем старый график для сравнения (перед сохранением нового)
-        old_schedule = db.get_schedule(city_id, schedule_type) or {}
-        
-        # Сохраняем объединённый график в базу
-        db.save_schedule(city_id, merged_schedule, schedule_type)
-        logger.info(f"💾 Сохранён объединённый график: {len(merged_schedule)} групп")
-        
-        # Отправляем уведомления подписчикам
-        if context and context.application:
-            asyncio.create_task(notify_subscribers_about_schedule_update(context.application, city_id, city.name, old_schedule, merged_schedule))
-        
-        # Обновляем счётчик
         photo_count = len(user_context[user_id]["upload_schedule_photos"])
-        groups_count = len(merged_schedule)
         
-        logger.info(f"✅ Обработано фото {photo_count} для города '{city.name}'. Всего групп: {groups_count}")
+        logger.info(f"📸 Фото {photo_count} сохранено во временное хранилище (город: {city.name})")
         
-        if photo_count < 3:
-            await update.message.reply_text(
-                f"✅ График распознан! ({photo_count}/3)\n\n"
-                f"📊 Распознано групп: {groups_count}\n\n"
-                "Можете отправить ещё фото или нажмите 'Готово'.",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("✅ Готово", callback_data="upload_schedule_done")
-                ]])
-            )
-        else:
-            # Достигнут лимит фото - завершаем загрузку
-            user_context[user_id].pop("upload_schedule_city_id", None)
-            user_context[user_id].pop("upload_schedule_photos", None)
-            
-            await update.message.reply_text(
-                f"✅ График обновлён для города '{city.name}'!\n\n"
-                f"📊 Распознано групп: {groups_count}\n"
-                f"📸 Обработано фото: {photo_count}",
-                reply_markup=get_back_keyboard()
-            )
-            return ConversationHandler.END
+        # Показываем статус загрузки
+        await update.message.reply_text(
+            f"✅ Фото {photo_count} загружено!\n\n"
+            f"📸 Загружено фото: {photo_count}/3\n\n"
+            "Можете отправить ещё фото (до 3 штук) или нажмите '✅ Готово' для обработки всех фото.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Готово", callback_data="upload_schedule_done")
+            ]])
+        )
             
     except Exception as e:
-        logger.error(f"Ошибка при обработке фото графика: {e}", exc_info=True)
+        logger.error(f"Ошибка при сохранении фото: {e}", exc_info=True)
         await update.message.reply_text(
-            f"❌ Ошибка при распознавании: {str(e)}\n\n"
-            "Попробуйте отправить другое фото или нажмите 'Готово'.",
+            f"❌ Ошибка при сохранении фото: {str(e)}\n\n"
+            "Попробуйте отправить другое фото или нажмите '✅ Готово'.",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("✅ Готово", callback_data="upload_schedule_done")
             ]])
@@ -2397,53 +2730,117 @@ async def handle_schedule_text(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def upload_schedule_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Завершение загрузки графика"""
+    """Завершение загрузки графика - обрабатываем все фото через Gemini"""
     query = update.callback_query
     await query.answer()
     
     user_id = update.effective_user.id
-    if user_id in user_context and "upload_schedule_city_id" in user_context[user_id]:
-        city_id = user_context[user_id]["upload_schedule_city_id"]
-        city = db.get_city(city_id)
-        
-        # Получаем финальный график из базы (проверяем оба)
-        schedules = db.get_both_schedules(city_id)
-        final_schedule_today = schedules.get("today") or {}
-        final_schedule_tomorrow = schedules.get("tomorrow") or {}
-        groups_count = len(final_schedule_today) + len(final_schedule_tomorrow)
-        photo_count = len(user_context[user_id].get("upload_schedule_photos", []))
-        
-        # Отправляем уведомления подписчикам (если график был сохранён)
-        if groups_count > 0 and context and context.application:
-            # Получаем старый график для сравнения (если он был до загрузки)
-            # Но так как график уже сохранён, используем финальный как новый
-            # Объединяем графики на сегодня и завтра для уведомления
-            final_schedule_combined = {**final_schedule_today, **final_schedule_tomorrow}
-            asyncio.create_task(notify_subscribers_about_schedule_update(context.application, city_id, city.name, {}, final_schedule_combined))
-        
-        user_context[user_id].pop("upload_schedule_city_id", None)
-        user_context[user_id].pop("upload_schedule_photos", None)
-        
-        if groups_count > 0:
-            await query.edit_message_text(
-                f"✅ График обновлён для города '{city.name}'!\n\n"
-                f"📊 Распознано групп: {groups_count}\n"
-                f"📸 Обработано фото: {photo_count}",
-                reply_markup=get_back_keyboard()
-            )
-        else:
-            await query.edit_message_text(
-                f"⚠️ График не был распознан.\n\n"
-                f"Попробуйте загрузить фото ещё раз.",
-                reply_markup=get_back_keyboard()
-            )
-    else:
+    if user_id not in user_context or "upload_schedule_city_id" not in user_context[user_id]:
+        await query.edit_message_text("❌ Ошибка. Начните заново.")
+        return ConversationHandler.END
+    
+    city_id = user_context[user_id]["upload_schedule_city_id"]
+    city = db.get_city(city_id)
+    
+    # Получаем список загруженных фото (байты)
+    photos_bytes = user_context[user_id].get("upload_schedule_photos", [])
+    mime_types = user_context[user_id].get("upload_schedule_mime_types", [])
+    
+    if not photos_bytes:
         await query.edit_message_text(
-            "❌ Ошибка. Начните загрузку заново.",
+            "⚠️ Не загружено ни одного фото.\n\n"
+            "Отправьте фото с графиком или начните заново.",
             reply_markup=get_back_keyboard()
         )
+        # Очищаем контекст
+        user_context[user_id].pop("upload_schedule_city_id", None)
+        user_context[user_id].pop("upload_schedule_photos", None)
+        user_context[user_id].pop("upload_schedule_mime_types", None)
+        return ConversationHandler.END
     
-    return ConversationHandler.END
+    # Показываем, что начинаем обработку
+    await query.edit_message_text(f"⏳ Обрабатываю {len(photos_bytes)} фото через Gemini...")
+    
+    try:
+        # ВАЖНО: Теперь обрабатываем ВСЕ фото через Gemini
+        merged_schedule = {}
+        processed_count = 0
+        
+        for i, (photo_bytes, mime_type) in enumerate(zip(photos_bytes, mime_types), 1):
+            logger.info(f"📸 Обрабатываю фото {i}/{len(photos_bytes)} через Gemini...")
+            
+            # Анализируем фото через Gemini
+            schedule_data = await asyncio.to_thread(analyze_schedule_image, photo_bytes, mime_type)
+            
+            if schedule_data:
+                groups_list = list(schedule_data.keys())
+                logger.info(f"   ✅ Фото {i}: распознано {len(schedule_data)} групп - {groups_list}")
+                
+                # Объединяем данные из всех фото
+                merged_schedule.update(schedule_data)
+                processed_count += 1
+            else:
+                logger.warning(f"   ⚠️ Фото {i}: не удалось распознать график")
+        
+        if not merged_schedule:
+            await query.edit_message_text(
+                "❌ Не удалось распознать график ни на одном фото.\n\n"
+                "Попробуйте отправить другие фото.",
+                reply_markup=get_back_keyboard()
+            )
+            # Очищаем контекст
+            user_context[user_id].pop("upload_schedule_city_id", None)
+            user_context[user_id].pop("upload_schedule_photos", None)
+            user_context[user_id].pop("upload_schedule_mime_types", None)
+            return ConversationHandler.END
+        
+        # По умолчанию сохраняем как завтра (так как дата не определена из загруженного фото)
+        schedule_type = "tomorrow"
+        
+        # Получаем старый график для сравнения (перед сохранением нового)
+        old_schedule = db.get_schedule(city_id, schedule_type) or {}
+        
+        # Сохраняем объединённый график в базу
+        db.save_schedule(city_id, merged_schedule, schedule_type)
+        logger.info(f"💾 Сохранён объединённый график: {len(merged_schedule)} групп из {processed_count} фото")
+        
+        # Отправляем уведомления подписчикам
+        if context and context.application:
+            asyncio.create_task(notify_subscribers_about_schedule_update(
+                context.application, city_id, city.name, old_schedule, merged_schedule
+            ))
+        
+        groups_count = len(merged_schedule)
+        
+        # Очищаем контекст
+        user_context[user_id].pop("upload_schedule_city_id", None)
+        user_context[user_id].pop("upload_schedule_photos", None)
+        user_context[user_id].pop("upload_schedule_mime_types", None)
+        
+        await query.edit_message_text(
+            f"✅ График успешно обработан и сохранён!\n\n"
+            f"🏙️ Город: <b>{city.name}</b>\n"
+            f"📸 Обработано фото: {processed_count}/{len(photos_bytes)}\n"
+            f"📊 Распознано групп: {groups_count}\n"
+            f"📅 Дата: завтра",
+            reply_markup=get_back_keyboard(),
+            parse_mode=ParseMode.HTML
+        )
+        
+        return ConversationHandler.END
+        
+    except Exception as e:
+        logger.error(f"Ошибка при обработке фото графика: {e}", exc_info=True)
+        await query.edit_message_text(
+            f"❌ Ошибка при обработке: {str(e)}\n\n"
+            "Попробуйте загрузить фото заново.",
+            reply_markup=get_back_keyboard()
+        )
+        # Очищаем контекст
+        user_context[user_id].pop("upload_schedule_city_id", None)
+        user_context[user_id].pop("upload_schedule_photos", None)
+        user_context[user_id].pop("upload_schedule_mime_types", None)
+        return ConversationHandler.END
 
 
 # ========== ПРОСМОТР ГРАФИКА ==========
@@ -3431,7 +3828,15 @@ def main():
             CommandHandler("test_post", admin_test_post),
         ],
         states={
-            WAITING_ADMIN_POST: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_admin_post)],
+            WAITING_ADMIN_CITY: [
+                CallbackQueryHandler(admin_select_city, pattern="^admin_city_"),
+                CallbackQueryHandler(admin_select_city, pattern="^admin_cancel$"),
+            ],
+            WAITING_ADMIN_POST: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, process_admin_post),
+                MessageHandler(filters.PHOTO, process_admin_post),  # Поддержка фото
+                CallbackQueryHandler(admin_process_photos_handler, pattern="^admin_process_photos$"),
+            ],
         },
         fallbacks=[
             CommandHandler("start", start),
