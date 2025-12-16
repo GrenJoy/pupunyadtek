@@ -299,6 +299,71 @@ async def admin_test_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return WAITING_ADMIN_CITY
 
 
+async def admin_test_post_from_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик кнопки 'Проверить посты' из меню загрузки графика - город уже выбран"""
+    query = update.callback_query
+    await query.answer()
+    
+    try:
+        user_id = update.effective_user.id
+        
+        if not is_admin(user_id):
+            await query.edit_message_text(
+                "❌ <b>Доступ запрещен</b>\n\n"
+                "Эта функция доступна только администратору.",
+                parse_mode=ParseMode.HTML
+            )
+            return ConversationHandler.END
+        
+        # Получаем city_id из callback_data
+        city_id = int(query.data.split("_")[-1])
+        city = db.get_city(city_id)
+        
+        if not city:
+            await query.edit_message_text(
+                "❌ <b>Ошибка</b>\n\n"
+                "Город не найден.",
+                parse_mode=ParseMode.HTML
+            )
+            return ConversationHandler.END
+        
+        # Сохраняем выбранный город в context
+        context.user_data['admin_city_id'] = city_id
+        context.user_data['admin_city_name'] = city.name
+        # Инициализируем хранилище для фото
+        context.user_data['admin_photos'] = []
+        context.user_data['admin_photo_mime_types'] = []
+        
+        logger.info(f"🔧 Админ панель открыта для города {city.name} (ID: {city_id}) пользователем {user_id}")
+        
+        await query.edit_message_text(
+            f"🔧 <b>Панель администратора</b>\n\n"
+            f"Город: <b>{city.name}</b>\n\n"
+            "Отправьте текст поста ИЛИ фото (до 3 штук) из канала для тестирования.\n\n"
+            "💡 <b>Важно:</b> Если отправляете несколько фото, они будут обработаны все вместе после нажатия кнопки '✅ Обработать'.\n\n"
+            "Бот обработает через Gemini и покажет:\n"
+            "• Тип сообщения (full_today, partial_today, ignore и т.д.)\n"
+            "• График ДО изменений\n"
+            "• График ПОСЛЕ изменений\n\n"
+            "Используйте /cancel для отмены.",
+            parse_mode=ParseMode.HTML
+        )
+        
+        return WAITING_ADMIN_POST
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка в admin_test_post_from_city: {e}", exc_info=True)
+        try:
+            await query.edit_message_text(
+                f"❌ <b>Ошибка</b>\n\n"
+                f"Произошла ошибка: {str(e)}",
+                parse_mode=ParseMode.HTML
+            )
+        except:
+            pass
+        return ConversationHandler.END
+
+
 async def admin_select_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обрабатывает выбор города администратором"""
     query = update.callback_query
@@ -2190,8 +2255,13 @@ async def upload_schedule_city(update: Update, context: ContextTypes.DEFAULT_TYP
         [InlineKeyboardButton("📤 Загрузить свой график", callback_data=f"upload_manual_{city_id}")],
         [InlineKeyboardButton("🔍 Найти график в Telegram-канале", callback_data=f"upload_from_channel_{city_id}")],
         [InlineKeyboardButton("📋 Проверить графики", callback_data=f"check_schedule_photos_{city_id}")],
-        [InlineKeyboardButton("🔙 Назад", callback_data="upload_schedule")]
     ]
+    
+    # Добавляем кнопку "Проверить посты" для админа
+    if is_admin(user_id):
+        keyboard.append([InlineKeyboardButton("🔧 Проверить посты (Админ)", callback_data=f"admin_test_post_city_{city_id}")])
+    
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="upload_schedule")])
     
     # Формируем текст с информацией о доступности поиска
     help_text = ""
@@ -3830,6 +3900,7 @@ def main():
             CommandHandler("admin", admin_test_post),
             CommandHandler("test_post", admin_test_post),
             CommandHandler("start_test", admin_test_post),  # Добавляем обработчик для /start_test
+            CallbackQueryHandler(admin_test_post_from_city, pattern="^admin_test_post_city_"),  # Кнопка из меню загрузки графика
         ],
         states={
             WAITING_ADMIN_CITY: [
