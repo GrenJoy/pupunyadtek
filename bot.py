@@ -115,12 +115,15 @@ def get_back_keyboard():
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start"""
-    await update.message.reply_text(
-        "🏠 <b>Главное меню</b>\n\n"
-        "Выберите действие:",
-        reply_markup=get_main_menu_keyboard(),
-        parse_mode=ParseMode.HTML
-    )
+    try:
+        await update.message.reply_text(
+            "🏠 <b>Главное меню</b>\n\n"
+            "Выберите действие:",
+            reply_markup=get_main_menu_keyboard(),
+            parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
+        logger.error(f"❌ Ошибка в команде /start: {e}", exc_info=True)
 
 
 async def start_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3826,6 +3829,7 @@ def main():
         entry_points=[
             CommandHandler("admin", admin_test_post),
             CommandHandler("test_post", admin_test_post),
+            CommandHandler("start_test", admin_test_post),  # Добавляем обработчик для /start_test
         ],
         states={
             WAITING_ADMIN_CITY: [
@@ -3844,6 +3848,24 @@ def main():
         ],
     )
     application.add_handler(admin_post_conv)
+    
+    # Обработчик ошибок
+    async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Обработчик ошибок для всех обработчиков"""
+        logger.error(f"❌ Ошибка в обработчике: {context.error}", exc_info=True)
+        
+        # Пытаемся отправить сообщение пользователю, если это Update
+        if isinstance(update, Update) and update.effective_message:
+            try:
+                await update.effective_message.reply_text(
+                    f"❌ <b>Произошла ошибка</b>\n\n"
+                    f"Попробуйте ещё раз или используйте /start",
+                    parse_mode=ParseMode.HTML
+                )
+            except:
+                pass
+    
+    application.add_error_handler(error_handler)
     
     # Обработчики просмотра графика
     application.add_handler(CallbackQueryHandler(view_schedule_start, pattern="^view_schedule$"))
