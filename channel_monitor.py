@@ -1345,51 +1345,90 @@ class ChannelMonitor:
                             # Определяем тип сообщения (новая универсальная функция)
                             from gemini_service import detect_schedule_message_type, analyze_schedule_image, apply_dnipro_partial_update
                             
-                            # Быстрая проверка на ЦЕК/ЦЕЦ перед отправкой в Gemini
-                            text_lower = (text or "").lower()
-                            if "цек" in text_lower or "цец" in text_lower:
-                                msg_type = "ignore"
-                                logger.info("   ⏭️ Игнорируем (ЦЕК/ЦЕЦ - другой поставщик)")
-                            # ВАЖНО: Если есть фото, но нет текста или текст короткий - это скорее всего полный график
-                            elif text and len(text.strip()) >= 10:
-                                msg_type = await asyncio.to_thread(
-                                    detect_schedule_message_type,
-                                    text,
-                                    post_time_kyiv,
-                                    chat_username or ""
-                                )
-                            elif has_photo:
-                                # Если есть фото, но нет текста - определяем по дате поста
-                                # Проверку ЦЕК/ЦЕЦ на фото сделает analyze_schedule_image (вернет пустой словарь)
-                                from datetime import timedelta
-                                current_time = get_kyiv_time()
-                                today_date = current_time.date()
-                                post_date = post_time_kyiv.date()
+                            # ВАЖНО: Если есть фото, сначала анализируем фото, чтобы определить, есть ли там график
+                            # Это позволяет правильно обработать случаи, когда текст короткий ("ДТЕК на 17 грудня"),
+                            # но на фото есть полный график с группами
+                            msg_type = None
+                            
+                            if has_photo:
+                                # Сначала анализируем фото, чтобы понять, есть ли там график
+                                logger.info("   📸 Есть фото - сначала анализирую фото для определения типа...")
+                                # Пока не анализируем полностью, только проверяем наличие групп
+                                # Полный анализ будет ниже
                                 
-                                # Если пост опубликован сегодня и время раннее (до 12:00) - скорее всего график на сегодня
-                                # Если пост опубликован сегодня после 12:00 или завтра - график на завтра
-                                if post_date == today_date and post_time_kyiv.hour < 12:
-                                    msg_type = "full_today"
-                                    logger.info(f"   📸 Фото без текста (сегодня до 12:00) → определяю как full_today")
+                                # Быстрая проверка на ЦЕК/ЦЕЦ в тексте
+                                text_lower = (text or "").lower()
+                                if "цек" in text_lower or "цец" in text_lower:
+                                    msg_type = "ignore"
+                                    logger.info("   ⏭️ Игнорируем (ЦЕК/ЦЕЦ в тексте - другой поставщик)")
+                                elif text and len(text.strip()) >= 10:
+                                    # Если есть достаточно текста, проверяем его
+                                    msg_type = await asyncio.to_thread(
+                                        detect_schedule_message_type,
+                                        text,
+                                        post_time_kyiv,
+                                        chat_username or ""
+                                    )
+                                    logger.info(f"   📝 Тип из текста: {msg_type}")
+                                    
+                                    # Если текст определил как ignore, но есть фото - не игнорируем сразу,
+                                    # а проверим фото (возможно, график только на фото)
+                                    if msg_type == "ignore":
+                                        logger.info("   ⚠️ Текст определил как ignore, но есть фото - проверю фото")
+                                        msg_type = None  # Сбросим, чтобы проверить фото
                                 else:
-                                    msg_type = "full_tomorrow"
-                                    logger.info(f"   📸 Фото без текста → определяю как full_tomorrow")
+                                    # Нет текста или текст короткий - определяем по дате поста
+                                    from datetime import timedelta
+                                    current_time = get_kyiv_time()
+                                    today_date = current_time.date()
+                                    post_date = post_time_kyiv.date()
+                                    
+                                    if post_date == today_date and post_time_kyiv.hour < 12:
+                                        msg_type = "full_today"
+                                        logger.info(f"   📸 Фото без текста (сегодня до 12:00) → определяю как full_today")
+                                    else:
+                                        msg_type = "full_tomorrow"
+                                        logger.info(f"   📸 Фото без текста → определяю как full_tomorrow")
                             else:
-                                # Нет ни текста, ни фото - игнорируем
-                                msg_type = "ignore"
+                                # Нет фото - проверяем только текст
+                                text_lower = (text or "").lower()
+                                if "цек" in text_lower or "цец" in text_lower:
+                                    msg_type = "ignore"
+                                    logger.info("   ⏭️ Игнорируем (ЦЕК/ЦЕЦ - другой поставщик)")
+                                elif text and len(text.strip()) >= 10:
+                                    msg_type = await asyncio.to_thread(
+                                        detect_schedule_message_type,
+                                        text,
+                                        post_time_kyiv,
+                                        chat_username or ""
+                                    )
+                                else:
+                                    msg_type = "ignore"
                             
                             logger.info(f"   Сообщение: {msg_type} | @{chat_username}")
                             
-                            if msg_type == "ignore":
+                            # ВАЖНО: Если есть фото и тип еще не определен (или был ignore из текста),
+                            # не игнорируем сразу - проверим фото ниже
+                            if msg_type == "ignore" and not has_photo:
                                 logger.info("   Игнорируем (ЦЕК, вода, мусор, авария)")
                                 self.save_last_message_id(message.id, chat_username)
                                 return
                             
-                            # Определяем день
-                            if "today" in msg_type:
+                            # Определяем день (если msg_type еще не определен, используем завтра по умолчанию)
+                            if msg_type and "today" in msg_type:
                                 target_day = "today"
-                            else:
+                            elif msg_type and "tomorrow" in msg_type:
                                 target_day = "tomorrow"
+                            else:
+                                # Если тип не определен, определяем по дате поста
+                                current_time = get_kyiv_time()
+                                today_date = current_time.date()
+                                post_date = post_time_kyiv.date()
+                                if post_date == today_date and post_time_kyiv.hour < 12:
+                                    target_day = "today"
+                                else:
+                                    target_day = "tomorrow"
+                                logger.info(f"   📅 Тип не определен, использую {target_day} по умолчанию")
                             
                             city = self.db.get_city(monitored_channel_obj.city_id) if monitored_channel_obj else None
                             if not city:
@@ -1447,6 +1486,20 @@ class ChannelMonitor:
                                                     groups_list = list(schedule_data.keys())
                                                     logger.info(f"   ✅ Фото {photo_count}: Gemini вернул {len(schedule_data)} групп - {groups_list}")
                                                     
+                                                    # ВАЖНО: Если фото вернуло данные, но msg_type был "ignore" - переопределяем тип
+                                                    if msg_type == "ignore" or msg_type is None:
+                                                        # Определяем тип по количеству групп и дате поста
+                                                        if len(schedule_data) >= 6:
+                                                            # Полный график
+                                                            if "today" in (post_time_kyiv.strftime("%d.%m") if post_time_kyiv else ""):
+                                                                msg_type = "full_today"
+                                                            else:
+                                                                msg_type = "full_tomorrow"
+                                                            logger.info(f"   🔄 Переопределил тип на {msg_type} (найдено {len(schedule_data)} групп в фото)")
+                                                        else:
+                                                            msg_type = "partial_today"
+                                                            logger.info(f"   🔄 Переопределил тип на {msg_type} (найдено {len(schedule_data)} групп в фото)")
+                                                    
                                                     # Проверяем пересечения
                                                     overlapping_groups = [g for g in schedule_data.keys() if g in merged_schedule]
                                                     if overlapping_groups:
@@ -1461,6 +1514,14 @@ class ChannelMonitor:
                                             logger.error(f"   ❌ Ошибка с фото {photo_count} в альбоме (ID {msg.id}): {e}", exc_info=True)
                                 
                                 logger.info(f"   📊 Обработано {photo_count} фото из альбома, всего групп: {len(merged_schedule)}")
+                                
+                                # ВАЖНО: Если после анализа фото тип все еще "ignore", но есть данные - переопределяем
+                                if success and merged_schedule and (msg_type == "ignore" or msg_type is None):
+                                    if len(merged_schedule) >= 6:
+                                        msg_type = "full_tomorrow" if post_time_kyiv.hour >= 12 else "full_today"
+                                    else:
+                                        msg_type = "partial_today"
+                                    logger.info(f"   🔄 Финальное переопределение типа на {msg_type} (найдено {len(merged_schedule)} групп)")
                                 
                                 if success and merged_schedule:
                                     # === ПОЛНЫЙ ГРАФИК (фото) ===
@@ -1499,18 +1560,35 @@ class ChannelMonitor:
                                 await message.download_media(file=buffer)
                                 photo_bytes = buffer.getvalue()
                                 
-                                if photo_bytes:
-                                    logger.info(f"   ✅ Фото скачано ({len(photo_bytes)} байт)")
-                                    logger.info(f"   🤖 Отправляю фото в Gemini Vision для анализа...")
-                                    # ВАЖНО: Выполняем анализ в отдельном потоке!
-                                    schedule_data = await asyncio.to_thread(analyze_schedule_image, photo_bytes, "image/jpeg")
-                                    
-                                    if schedule_data:
-                                        groups_list = list(schedule_data.keys())
-                                        logger.info(f"   ✅ Gemini вернул данные: {len(schedule_data)} групп - {groups_list}")
+                                    if photo_bytes:
+                                        logger.info(f"   ✅ Фото скачано ({len(photo_bytes)} байт)")
+                                        logger.info(f"   🤖 Отправляю фото в Gemini Vision для анализа...")
+                                        # ВАЖНО: Выполняем анализ в отдельном потоке!
+                                        schedule_data = await asyncio.to_thread(analyze_schedule_image, photo_bytes, "image/jpeg")
                                         
-                                        # === ПОЛНЫЙ ГРАФИК (фото) ===
-                                        if msg_type.startswith("full_"):
+                                        if schedule_data:
+                                            groups_list = list(schedule_data.keys())
+                                            logger.info(f"   ✅ Gemini вернул данные: {len(schedule_data)} групп - {groups_list}")
+                                            
+                                            # ВАЖНО: Если фото вернуло данные, но msg_type был "ignore" - переопределяем тип
+                                            if msg_type == "ignore" or msg_type is None:
+                                                # Определяем тип по количеству групп и дате поста
+                                                if len(schedule_data) >= 6:
+                                                    # Полный график
+                                                    current_time = get_kyiv_time()
+                                                    today_date = current_time.date()
+                                                    post_date = post_time_kyiv.date()
+                                                    if post_date == today_date and post_time_kyiv.hour < 12:
+                                                        msg_type = "full_today"
+                                                    else:
+                                                        msg_type = "full_tomorrow"
+                                                    logger.info(f"   🔄 Переопределил тип на {msg_type} (найдено {len(schedule_data)} групп в фото)")
+                                                else:
+                                                    msg_type = "partial_today"
+                                                    logger.info(f"   🔄 Переопределил тип на {msg_type} (найдено {len(schedule_data)} групп в фото)")
+                                            
+                                            # === ПОЛНЫЙ ГРАФИК (фото) ===
+                                            if msg_type and msg_type.startswith("full_"):
                                             logger.info(f"   Полный график (одно фото) → {target_day}")
                                             logger.info(f"   🔄 ПОЛНАЯ ЗАМЕНА: старый график будет полностью заменён новым (не объединение!)")
                                             logger.info(f"   📊 Старый график: {len(old_schedule)} групп, новый график: {len(schedule_data)} групп")
