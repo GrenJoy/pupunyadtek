@@ -1142,9 +1142,14 @@ class ChannelMonitor:
                 # Это надежнее, чем фильтр chats=..., который может не сработать если кеш не обновлен
                 @self.client.on(events.NewMessage())
                 async def handler(event):
+                    # Инициализируем переменные, которые используются в finally
+                    chat_username = None 
+                    message_id = event.message.id
+                    message_key = None
+                    chat_id = event.chat_id
+                    
                     try:
                         message = event.message
-                        chat_id = event.chat_id
                         
                         # Получаем информацию о чате
                         try:
@@ -1239,120 +1244,123 @@ class ChannelMonitor:
                                 self._processing_messages.add(message_key)
                                 logger.debug(f"🔒 Пост {message.id} помечен как обрабатываемый")
                         
-                        # ВАЖНО: Для альбомов (grouped_id) обрабатываем только ПЕРВОЕ сообщение
-                        # Используем Lock для атомарности (защита от race condition)
-                        if hasattr(message, 'grouped_id') and message.grouped_id:
-                            # Проверяем, что Lock инициализирован
-                            if self._processed_albums_lock is None:
-                                logger.warning("⚠️ Lock не инициализирован, пропускаю проверку альбома")
-                            else:
-                                async with self._processed_albums_lock:
-                                    if message.grouped_id in self._processed_albums:
-                                        logger.debug(f"⏭️ Пропущено сообщение ID {message.id} - альбом {message.grouped_id} уже обрабатывается")
-                                        self.save_last_message_id(message.id, chat_username)
-                                        return
-                                    
-                                    self._processed_albums.add(message.grouped_id)
-                            logger.info(f"📸 Обнаружен альбом {message.grouped_id}, получаю все сообщения...")
-                            
-                            # Собираем текст альбома
-                            album_messages = []
-                            album_text = ""
-                            
-                            # ВАЖНО: Увеличиваем диапазон поиска для надёжности
-                            # Альбомы могут приходить не по порядку, поэтому ищем шире
-                            async for msg in self.client.iter_messages(
-                                message.peer_id,
-                                min_id=message.id - 30,
-                                max_id=message.id + 30
-                            ):
-                                if (hasattr(msg, 'grouped_id') and 
-                                    msg.grouped_id == message.grouped_id and
-                                    msg.photo):  # ВАЖНО: Только сообщения с фото
-                                    album_messages.append(msg)
-                                    msg_text = (msg.text or getattr(msg, 'message', None) or getattr(msg, 'raw_text', None) or "")
-                                    if msg_text and not album_text:
-                                        album_text = msg_text
-                            
-                            # Если не нашли все фото в диапазоне, пробуем ещё раз с большим диапазоном
-                            if len(album_messages) < 2:  # Если нашли меньше 2 фото, возможно альбом больше
-                                logger.info(f"   ⚠️ Найдено только {len(album_messages)} фото, расширяю поиск...")
+                        # ВАЖНО: Весь процессинг оборачиваем в try/finally, 
+                        # чтобы гарантированно снять блокировку
+                        try:
+                            # ВАЖНО: Для альбомов (grouped_id) обрабатываем только ПЕРВОЕ сообщение
+                            # Используем Lock для атомарности (защита от race condition)
+                            if hasattr(message, 'grouped_id') and message.grouped_id:
+                                # Проверяем, что Lock инициализирован
+                                if self._processed_albums_lock is None:
+                                    logger.warning("⚠️ Lock не инициализирован, пропускаю проверку альбома")
+                                else:
+                                    async with self._processed_albums_lock:
+                                        if message.grouped_id in self._processed_albums:
+                                            logger.debug(f"⏭️ Пропущено сообщение ID {message.id} - альбом {message.grouped_id} уже обрабатывается")
+                                            self.save_last_message_id(message.id, chat_username)
+                                            return
+                                        
+                                        self._processed_albums.add(message.grouped_id)
+                                logger.info(f"📸 Обнаружен альбом {message.grouped_id}, получаю все сообщения...")
+                                
+                                # Собираем текст альбома
+                                album_messages = []
+                                album_text = ""
+                                
+                                # ВАЖНО: Увеличиваем диапазон поиска для надёжности
+                                # Альбомы могут приходить не по порядку, поэтому ищем шире
                                 async for msg in self.client.iter_messages(
                                     message.peer_id,
-                                    min_id=message.id - 50,
-                                    max_id=message.id + 50
+                                    min_id=message.id - 30,
+                                    max_id=message.id + 30
                                 ):
                                     if (hasattr(msg, 'grouped_id') and 
                                         msg.grouped_id == message.grouped_id and
-                                        msg.photo and
-                                        msg not in album_messages):  # Избегаем дубликатов
+                                        msg.photo):  # ВАЖНО: Только сообщения с фото
                                         album_messages.append(msg)
                                         msg_text = (msg.text or getattr(msg, 'message', None) or getattr(msg, 'raw_text', None) or "")
                                         if msg_text and not album_text:
                                             album_text = msg_text
-                            
-                            logger.info(f"   📊 Найдено {len(album_messages)} фото в альбоме {message.grouped_id}")
-                            
-                            text = album_text
-                            album_messages.sort(key=lambda m: m.id)
-                            message = album_messages[0] if album_messages else message  # Работаем с первым сообщением или исходным
-                            
-                            # Очистка метки альбома будет выполнена периодически (см. _cleanup_old_albums)
-                            
-                        else:
-                            text = (message.text or getattr(message, 'message', None) or getattr(message, 'raw_text', None) or "")
-
-                        logger.info(f"   📌 ID: {message.id}")
-                        logger.info(f"   📝 Текст: {text[:200] if text else 'Нет текста'}...")
-                        
-                        # Получаем реальное время публикации поста и конвертируем в Киев
-                        from datetime import datetime
-                        try:
-                            # message.date в Telethon - это datetime объект (может быть UTC или naive)
-                            if message.date:
-                                if message.date.tzinfo is None:
-                                    # Если naive datetime, считаем что это UTC
-                                    from datetime import timezone
-                                    post_time_utc = message.date.replace(tzinfo=timezone.utc)
-                                else:
-                                    post_time_utc = message.date
                                 
-                                # Конвертируем в Киев
-                                try:
-                                    from zoneinfo import ZoneInfo
-                                    kyiv_tz = ZoneInfo("Europe/Kyiv")
-                                except ImportError:
-                                    import pytz
-                                    kyiv_tz = pytz.timezone("Europe/Kyiv")
+                                # Если не нашли все фото в диапазоне, пробуем ещё раз с большим диапазоном
+                                if len(album_messages) < 2:  # Если нашли меньше 2 фото, возможно альбом больше
+                                    logger.info(f"   ⚠️ Найдено только {len(album_messages)} фото, расширяю поиск...")
+                                    async for msg in self.client.iter_messages(
+                                        message.peer_id,
+                                        min_id=message.id - 50,
+                                        max_id=message.id + 50
+                                    ):
+                                        if (hasattr(msg, 'grouped_id') and 
+                                            msg.grouped_id == message.grouped_id and
+                                            msg.photo and
+                                            msg not in album_messages):  # Избегаем дубликатов
+                                            album_messages.append(msg)
+                                            msg_text = (msg.text or getattr(msg, 'message', None) or getattr(msg, 'raw_text', None) or "")
+                                            if msg_text and not album_text:
+                                                album_text = msg_text
                                 
-                                post_time_kyiv = post_time_utc.astimezone(kyiv_tz)
-                                logger.info(f"   📅 Время поста: {post_time_kyiv.strftime('%H:%M %d.%m.%Y')}")
+                                logger.info(f"   📊 Найдено {len(album_messages)} фото в альбоме {message.grouped_id}")
+                                
+                                text = album_text
+                                album_messages.sort(key=lambda m: m.id)
+                                message = album_messages[0] if album_messages else message  # Работаем с первым сообщением или исходным
+                                
+                                # Очистка метки альбома будет выполнена периодически (см. _cleanup_old_albums)
+                            
                             else:
-                                # Fallback на текущее время, если дата не доступна
+                                text = (message.text or getattr(message, 'message', None) or getattr(message, 'raw_text', None) or "")
+
+                            logger.info(f"   📌 ID: {message.id}")
+                            logger.info(f"   📝 Текст: {text[:200] if text else 'Нет текста'}...")
+                            
+                            # Получаем реальное время публикации поста и конвертируем в Киев
+                            from datetime import datetime
+                            try:
+                                # message.date в Telethon - это datetime объект (может быть UTC или naive)
+                                if message.date:
+                                    if message.date.tzinfo is None:
+                                        # Если naive datetime, считаем что это UTC
+                                        from datetime import timezone
+                                        post_time_utc = message.date.replace(tzinfo=timezone.utc)
+                                    else:
+                                        post_time_utc = message.date
+                                    
+                                    # Конвертируем в Киев
+                                    try:
+                                        from zoneinfo import ZoneInfo
+                                        kyiv_tz = ZoneInfo("Europe/Kyiv")
+                                    except ImportError:
+                                        import pytz
+                                        kyiv_tz = pytz.timezone("Europe/Kyiv")
+                                    
+                                    post_time_kyiv = post_time_utc.astimezone(kyiv_tz)
+                                    logger.info(f"   📅 Время поста: {post_time_kyiv.strftime('%H:%M %d.%m.%Y')}")
+                                else:
+                                    # Fallback на текущее время, если дата не доступна
+                                    post_time_kyiv = get_kyiv_time()
+                                    logger.warning(f"   ⚠️ Дата поста недоступна, использую текущее время")
+                            except Exception as e:
+                                logger.warning(f"   ⚠️ Ошибка при получении времени поста: {e}, использую текущее время")
                                 post_time_kyiv = get_kyiv_time()
-                                logger.warning(f"   ⚠️ Дата поста недоступна, использую текущее время")
-                        except Exception as e:
-                            logger.warning(f"   ⚠️ Ошибка при получении времени поста: {e}, использую текущее время")
-                            post_time_kyiv = get_kyiv_time()
-                        
-                        # Проверяем наличие фото
-                        has_photo = message.photo or (hasattr(message, 'grouped_id') and message.grouped_id)
-                        
-                        if has_photo:
-                            logger.info(f"   📸 Обнаружены фотографии, начинаю обработку...")
-                            logger.info(f"   🤖 ШАГ 2: Отправляю фото в Gemini Vision для анализа...")
                             
-                            # Определяем тип сообщения (новая универсальная функция)
-                            from gemini_service import detect_schedule_message_type, analyze_schedule_image, apply_dnipro_partial_update
-                            
-                            # ВАЖНО: Если есть фото, сначала анализируем фото, чтобы определить, есть ли там график
-                            # Это позволяет правильно обработать случаи, когда текст короткий ("ДТЕК на 17 грудня"),
-                            # но на фото есть полный график с группами
-                            msg_type = None
+                            # Проверяем наличие фото
+                            has_photo = message.photo or (hasattr(message, 'grouped_id') and message.grouped_id)
                             
                             if has_photo:
-                                # Сначала анализируем фото, чтобы понять, есть ли там график
-                                logger.info("   📸 Есть фото - сначала анализирую фото для определения типа...")
+                                logger.info(f"   📸 Обнаружены фотографии, начинаю обработку...")
+                                logger.info(f"   🤖 ШАГ 2: Отправляю фото в Gemini Vision для анализа...")
+                                
+                                # Определяем тип сообщения (новая универсальная функция)
+                                from gemini_service import detect_schedule_message_type, analyze_schedule_image, apply_dnipro_partial_update
+                                
+                                # ВАЖНО: Если есть фото, сначала анализируем фото, чтобы определить, есть ли там график
+                                # Это позволяет правильно обработать случаи, когда текст короткий ("ДТЕК на 17 грудня"),
+                                # но на фото есть полный график с группами
+                                msg_type = None
+                                
+                                if has_photo:
+                                    # Сначала анализируем фото, чтобы понять, есть ли там график
+                                    logger.info("   📸 Есть фото - сначала анализирую фото для определения типа...")
                                 # Пока не анализируем полностью, только проверяем наличие групп
                                 # Полный анализ будет ниже
                                 
@@ -1444,6 +1452,7 @@ class ChannelMonitor:
                             
                             success = False
                             processed_groups = 0
+                            album_messages = []  # Инициализируем перед использованием
                             
                             # Если альбом
                             if hasattr(message, 'grouped_id') and message.grouped_id:
@@ -1560,35 +1569,36 @@ class ChannelMonitor:
                                 await message.download_media(file=buffer)
                                 photo_bytes = buffer.getvalue()
                                 
-                                    if photo_bytes:
-                                        logger.info(f"   ✅ Фото скачано ({len(photo_bytes)} байт)")
-                                        logger.info(f"   🤖 Отправляю фото в Gemini Vision для анализа...")
-                                        # ВАЖНО: Выполняем анализ в отдельном потоке!
-                                        schedule_data = await asyncio.to_thread(analyze_schedule_image, photo_bytes, "image/jpeg")
+                                # ИСПРАВЛЕННЫЙ ОТСТУП ЗДЕСЬ (сдвинуто влево)
+                                if photo_bytes:
+                                    logger.info(f"   ✅ Фото скачано ({len(photo_bytes)} байт)")
+                                    logger.info(f"   🤖 Отправляю фото в Gemini Vision для анализа...")
+                                    # ВАЖНО: Выполняем анализ в отдельном потоке!
+                                    schedule_data = await asyncio.to_thread(analyze_schedule_image, photo_bytes, "image/jpeg")
+                                    
+                                    if schedule_data:
+                                        groups_list = list(schedule_data.keys())
+                                        logger.info(f"   ✅ Gemini вернул данные: {len(schedule_data)} групп - {groups_list}")
                                         
-                                        if schedule_data:
-                                            groups_list = list(schedule_data.keys())
-                                            logger.info(f"   ✅ Gemini вернул данные: {len(schedule_data)} групп - {groups_list}")
-                                            
-                                            # ВАЖНО: Если фото вернуло данные, но msg_type был "ignore" - переопределяем тип
-                                            if msg_type == "ignore" or msg_type is None:
-                                                # Определяем тип по количеству групп и дате поста
-                                                if len(schedule_data) >= 6:
-                                                    # Полный график
-                                                    current_time = get_kyiv_time()
-                                                    today_date = current_time.date()
-                                                    post_date = post_time_kyiv.date()
-                                                    if post_date == today_date and post_time_kyiv.hour < 12:
-                                                        msg_type = "full_today"
-                                                    else:
-                                                        msg_type = "full_tomorrow"
-                                                    logger.info(f"   🔄 Переопределил тип на {msg_type} (найдено {len(schedule_data)} групп в фото)")
+                                        # ВАЖНО: Если фото вернуло данные, но msg_type был "ignore" - переопределяем тип
+                                        if msg_type == "ignore" or msg_type is None:
+                                            # Определяем тип по количеству групп и дате поста
+                                            if len(schedule_data) >= 6:
+                                                # Полный график
+                                                current_time = get_kyiv_time()
+                                                today_date = current_time.date()
+                                                post_date = post_time_kyiv.date()
+                                                if post_date == today_date and post_time_kyiv.hour < 12:
+                                                    msg_type = "full_today"
                                                 else:
-                                                    msg_type = "partial_today"
-                                                    logger.info(f"   🔄 Переопределил тип на {msg_type} (найдено {len(schedule_data)} групп в фото)")
-                                            
-                                            # === ПОЛНЫЙ ГРАФИК (фото) ===
-                                            if msg_type and msg_type.startswith("full_"):
+                                                    msg_type = "full_tomorrow"
+                                                logger.info(f"   🔄 Переопределил тип на {msg_type} (найдено {len(schedule_data)} групп в фото)")
+                                            else:
+                                                msg_type = "partial_today"
+                                                logger.info(f"   🔄 Переопределил тип на {msg_type} (найдено {len(schedule_data)} групп в фото)")
+                                        
+                                        # === ПОЛНЫЙ ГРАФИК (фото) ===
+                                        if msg_type and msg_type.startswith("full_"):
                                             logger.info(f"   Полный график (одно фото) → {target_day}")
                                             logger.info(f"   🔄 ПОЛНАЯ ЗАМЕНА: старый график будет полностью заменён новым (не объединение!)")
                                             logger.info(f"   📊 Старый график: {len(old_schedule)} групп, новый график: {len(schedule_data)} групп")
@@ -1625,138 +1635,138 @@ class ChannelMonitor:
                                     else:
                                         logger.warning(f"   ⚠️ Gemini не вернул данные для фото")
                             
-                            if success:
-                                logger.info(f"   🎉 График успешно обработан!")
+                                if success:
+                                    logger.info(f"   🎉 График успешно обработан!")
+                                else:
+                                    logger.warning(f"   ❌ Не удалось извлечь данные из фото")
+                            
                             else:
-                                logger.warning(f"   ❌ Не удалось извлечь данные из фото")
-
-                        else:
-                            # === НОВАЯ ЛОГИКА: Обработка текстовых постов с определением типа ===
-                            if text and len(text.strip()) > 0:
-                                logger.info(f"   📝 Пост без фото, текст ({len(text)} символов) - проверяю через Gemini...")
-                                
-                                # Время поста уже получено выше
-                                
-                                # Определяем тип сообщения (новая универсальная функция)
-                                from gemini_service import detect_schedule_message_type, apply_dnipro_partial_update, analyze_schedule_image, analyze_schedule_text
-                                
-                                msg_type = await asyncio.to_thread(
-                                    detect_schedule_message_type,
-                                    text,
-                                    post_time_kyiv,
-                                    chat_username or ""
-                                )
-                                
-                                logger.info(f"   Сообщение: {msg_type} | @{chat_username}")
-                                logger.info(f"   📅 Время поста: {post_time_kyiv.strftime('%H:%M %d.%m.%Y')}")
-                                
-                                if msg_type == "ignore":
-                                    logger.info("   Игнорируем (ЦЕК, вода, мусор, авария)")
-                                    self.save_last_message_id(message.id, chat_username)
-                                    return
-                                
-                                # Определяем день
-                                if "today" in msg_type:
-                                    target_day = "today"
-                                    logger.info(f"   ✅ Определён как график на СЕГОДНЯ ({target_day})")
-                                else:
-                                    target_day = "tomorrow"
-                                    logger.info(f"   ✅ Определён как график на ЗАВТРА ({target_day})")
-                                
-                                city = self.db.get_city(monitored_channel_obj.city_id) if monitored_channel_obj else None
-                                if not city:
-                                    logger.warning(f"   ⚠️ Город не найден для канала @{chat_username}")
-                                    self.save_last_message_id(message.id, chat_username)
-                                    return
-                                
-                                old_schedule = self.db.get_schedule(city.id, target_day) or {}
-                                
-                                # Определяем, является ли канал Днепром
-                                is_dnipro = city.name.lower() in ["днепр", "дніпро", "dnipro"] or \
-                                            (chat_username and "dniproavariyka" in chat_username.lower())
-                                
-                                # === ПОЛНЫЙ ГРАФИК (фото или длинный текст) ===
-                                if msg_type.startswith("full_"):
-                                    logger.info(f"   Полный график → {target_day}")
-                                    logger.info(f"   🔄 ПОЛНАЯ ЗАМЕНА: старый график будет полностью заменён новым (не объединение!)")
-                                    logger.info(f"   📊 Старый график: {len(old_schedule)} групп, новый график будет извлечён из текста")
+                                # === НОВАЯ ЛОГИКА: Обработка текстовых постов с определением типа ===
+                                if text and len(text.strip()) > 0:
+                                    logger.info(f"   📝 Пост без фото, текст ({len(text)} символов) - проверяю через Gemini...")
                                     
-                                    schedule_data = await asyncio.to_thread(analyze_schedule_text, text)
+                                    # Время поста уже получено выше
                                     
-                                    # КРИТИЧЕСКИ ВАЖНЫЙ FALLBACK: Если график слишком маленький (<6 групп) - это подозрительно!
-                                    # Скорее всего это частичное обновление, которое ошибочно классифицировано как full
-                                    if schedule_data and len(schedule_data) < 6:
-                                        logger.warning(f"   ⚠️ ПОДОЗРИТЕЛЬНО: График имеет только {len(schedule_data)} групп (ожидалось ≥6)")
-                                        logger.warning(f"   ⚠️ Это может быть частичное обновление, ошибочно классифицированное как full!")
-                                        
-                                        # Если это Днепр - используем частичное обновление
-                                        if is_dnipro:
-                                            logger.info(f"   🔄 FALLBACK: Принудительно трактуем как partial_today и объединяем со старым графиком")
-                                            new_schedule = await asyncio.to_thread(
-                                                apply_dnipro_partial_update,
-                                                old_schedule,
-                                                text,
-                                                post_time_kyiv.strftime("%H:%M")
-                                            )
-                                            if new_schedule != old_schedule:
-                                                self.db.save_schedule(city.id, new_schedule, target_day)
-                                                await self._notify_subscribers_about_changes(
-                                                    city.id, city.name, old_schedule, new_schedule, target_day
-                                                )
-                                        else:
-                                            # Для других городов - объединяем через merge_schedules
-                                            logger.info(f"   🔄 FALLBACK: Объединяем со старым графиком через merge_schedules")
-                                            from gemini_service import merge_schedules
-                                            if old_schedule:
-                                                merged_schedule = merge_schedules(old_schedule, schedule_data)
-                                                self.db.save_schedule(city.id, merged_schedule, target_day)
-                                                await self._notify_subscribers_about_changes(
-                                                    city.id, city.name, old_schedule, merged_schedule, target_day
-                                                )
-                                            else:
-                                                # Если старого графика нет - сохраняем как есть
-                                                self.db.save_schedule(city.id, schedule_data, target_day)
-                                                await self._notify_subscribers_about_changes(
-                                                    city.id, city.name, old_schedule or {}, schedule_data, target_day
-                                                )
-                                    elif schedule_data and len(schedule_data) >= 6:
-                                        logger.info(f"   📊 Новый график: {len(schedule_data)} групп - ПОЛНОСТЬЮ заменяет старый")
-                                        self.db.save_schedule(city.id, schedule_data, target_day)
-                                        await self._notify_subscribers_about_changes(
-                                            city.id, city.name, old_schedule, schedule_data, target_day
-                                        )
-                                    else:
-                                        logger.warning(f"   ⚠️ Не удалось извлечь график из текста")
-                                
-                                # === ЧАСТИЧНОЕ ОБНОВЛЕНИЕ — ТОЛЬКО ДНЕПР ===
-                                elif msg_type.startswith("partial_") and is_dnipro:
-                                    logger.info(f"   Частичное обновление Днепра → {target_day}")
-                                    new_schedule = await asyncio.to_thread(
-                                        apply_dnipro_partial_update,
-                                        old_schedule,
+                                    # Определяем тип сообщения (новая универсальная функция)
+                                    from gemini_service import detect_schedule_message_type, apply_dnipro_partial_update, analyze_schedule_image, analyze_schedule_text
+                                    
+                                    msg_type = await asyncio.to_thread(
+                                        detect_schedule_message_type,
                                         text,
-                                        post_time_kyiv.strftime("%H:%M")
+                                        post_time_kyiv,
+                                        chat_username or ""
                                     )
-                                    if new_schedule != old_schedule:
-                                        self.db.save_schedule(city.id, new_schedule, target_day)
-                                        await self._notify_subscribers_about_changes(
-                                            city.id, city.name, old_schedule, new_schedule, target_day
-                                        )
-                                
-                                # === ОБРАБОТКА ДЛЯ ДРУГИХ ГОРОДОВ (не Днепр) ===
-                                else:
-                                    logger.info(f"   Обработка для других городов (не Днепр)")
-                                    # Для других городов используем старую логику, но через новую функцию определения типа
-                                    from gemini_service import analyze_schedule_text, is_complete_schedule, merge_schedules
                                     
-                                    # Преобразуем новый тип в старый формат для совместимости
-                                    if msg_type.startswith("full_"):
-                                        schedule_type = target_day
-                                    elif msg_type.startswith("partial_"):
-                                        # Для частичных обновлений других городов используем merge_schedules
-                                        schedule_type = target_day
+                                    logger.info(f"   Сообщение: {msg_type} | @{chat_username}")
+                                    logger.info(f"   📅 Время поста: {post_time_kyiv.strftime('%H:%M %d.%m.%Y')}")
+                                    
+                                    if msg_type == "ignore":
+                                        logger.info("   Игнорируем (ЦЕК, вода, мусор, авария)")
+                                        self.save_last_message_id(message.id, chat_username)
+                                        return
+                                    
+                                    # Определяем день
+                                    if "today" in msg_type:
+                                        target_day = "today"
+                                        logger.info(f"   ✅ Определён как график на СЕГОДНЯ ({target_day})")
                                     else:
-                                        schedule_type = None
+                                        target_day = "tomorrow"
+                                        logger.info(f"   ✅ Определён как график на ЗАВТРА ({target_day})")
+                                    
+                                    city = self.db.get_city(monitored_channel_obj.city_id) if monitored_channel_obj else None
+                                    if not city:
+                                        logger.warning(f"   ⚠️ Город не найден для канала @{chat_username}")
+                                        self.save_last_message_id(message.id, chat_username)
+                                        return
+                                    
+                                    old_schedule = self.db.get_schedule(city.id, target_day) or {}
+                                    
+                                    # Определяем, является ли канал Днепром
+                                    is_dnipro = city.name.lower() in ["днепр", "дніпро", "dnipro"] or \
+                                                (chat_username and "dniproavariyka" in chat_username.lower())
+                                    
+                                    # === ПОЛНЫЙ ГРАФИК (фото или длинный текст) ===
+                                    if msg_type.startswith("full_"):
+                                        logger.info(f"   Полный график → {target_day}")
+                                        logger.info(f"   🔄 ПОЛНАЯ ЗАМЕНА: старый график будет полностью заменён новым (не объединение!)")
+                                        logger.info(f"   📊 Старый график: {len(old_schedule)} групп, новый график будет извлечён из текста")
+                                        
+                                        schedule_data = await asyncio.to_thread(analyze_schedule_text, text)
+                                        
+                                        # КРИТИЧЕСКИ ВАЖНЫЙ FALLBACK: Если график слишком маленький (<6 групп) - это подозрительно!
+                                        # Скорее всего это частичное обновление, которое ошибочно классифицировано как full
+                                        if schedule_data and len(schedule_data) < 6:
+                                            logger.warning(f"   ⚠️ ПОДОЗРИТЕЛЬНО: График имеет только {len(schedule_data)} групп (ожидалось ≥6)")
+                                            logger.warning(f"   ⚠️ Это может быть частичное обновление, ошибочно классифицированное как full!")
+                                            
+                                            # Если это Днепр - используем частичное обновление
+                                            if is_dnipro:
+                                                logger.info(f"   🔄 FALLBACK: Принудительно трактуем как partial_today и объединяем со старым графиком")
+                                                new_schedule = await asyncio.to_thread(
+                                                    apply_dnipro_partial_update,
+                                                    old_schedule,
+                                                    text,
+                                                    post_time_kyiv.strftime("%H:%M")
+                                                )
+                                                if new_schedule != old_schedule:
+                                                    self.db.save_schedule(city.id, new_schedule, target_day)
+                                                    await self._notify_subscribers_about_changes(
+                                                        city.id, city.name, old_schedule, new_schedule, target_day
+                                                    )
+                                            else:
+                                                # Для других городов - объединяем через merge_schedules
+                                                logger.info(f"   🔄 FALLBACK: Объединяем со старым графиком через merge_schedules")
+                                                from gemini_service import merge_schedules
+                                                if old_schedule:
+                                                    merged_schedule = merge_schedules(old_schedule, schedule_data)
+                                                    self.db.save_schedule(city.id, merged_schedule, target_day)
+                                                    await self._notify_subscribers_about_changes(
+                                                        city.id, city.name, old_schedule, merged_schedule, target_day
+                                                    )
+                                                else:
+                                                    # Если старого графика нет - сохраняем как есть
+                                                    self.db.save_schedule(city.id, schedule_data, target_day)
+                                                    await self._notify_subscribers_about_changes(
+                                                        city.id, city.name, old_schedule or {}, schedule_data, target_day
+                                                    )
+                                        elif schedule_data and len(schedule_data) >= 6:
+                                            logger.info(f"   📊 Новый график: {len(schedule_data)} групп - ПОЛНОСТЬЮ заменяет старый")
+                                            self.db.save_schedule(city.id, schedule_data, target_day)
+                                            await self._notify_subscribers_about_changes(
+                                                city.id, city.name, old_schedule, schedule_data, target_day
+                                            )
+                                        else:
+                                            logger.warning(f"   ⚠️ Не удалось извлечь график из текста")
+                                    
+                                    # === ЧАСТИЧНОЕ ОБНОВЛЕНИЕ — ТОЛЬКО ДНЕПР ===
+                                    elif msg_type.startswith("partial_") and is_dnipro:
+                                        logger.info(f"   Частичное обновление Днепра → {target_day}")
+                                        new_schedule = await asyncio.to_thread(
+                                            apply_dnipro_partial_update,
+                                            old_schedule,
+                                            text,
+                                            post_time_kyiv.strftime("%H:%M")
+                                        )
+                                        if new_schedule != old_schedule:
+                                            self.db.save_schedule(city.id, new_schedule, target_day)
+                                            await self._notify_subscribers_about_changes(
+                                                city.id, city.name, old_schedule, new_schedule, target_day
+                                            )
+                                    
+                                    # === ОБРАБОТКА ДЛЯ ДРУГИХ ГОРОДОВ (не Днепр) ===
+                                    else:
+                                        logger.info(f"   Обработка для других городов (не Днепр)")
+                                        # Для других городов используем старую логику, но через новую функцию определения типа
+                                        from gemini_service import analyze_schedule_text, is_complete_schedule, merge_schedules
+                                        
+                                        # Преобразуем новый тип в старый формат для совместимости
+                                        if msg_type.startswith("full_"):
+                                            schedule_type = target_day
+                                        elif msg_type.startswith("partial_"):
+                                            # Для частичных обновлений других городов используем merge_schedules
+                                            schedule_type = target_day
+                                        else:
+                                            schedule_type = None
                                     
                                     if schedule_type:
                                         logger.info(f"   ✅ Это график отключений ({schedule_type})!")
@@ -1793,37 +1803,34 @@ class ChannelMonitor:
                                             await self._notify_subscribers_about_changes(city.id, city.name, old_schedule or {}, final_schedule, schedule_type)
                                     else:
                                         logger.info("   ❌ Это НЕ график (игнор) - пропускаю пост")
-                            else:
-                                logger.debug(f"   ⏭️ Пост без фото и без текста - пропускаю")
+                                else:
+                                    logger.debug(f"   ⏭️ Пост без фото и без текста - пропускаю")
+                            
+                            # ВАЖНО: Сохраняем ID только после полной обработки поста
+                            # Это предотвращает повторную обработку одного и того же поста
+                            if chat_username:
+                                self.save_last_message_id(message.id, chat_username)
+                                logger.debug(f"💾 Сохранён last_message_id={message.id} для канала @{chat_username}")
                         
-                        # ВАЖНО: Сохраняем ID только после полной обработки поста
-                        # Это предотвращает повторную обработку одного и того же поста
-                        if chat_username:
-                            self.save_last_message_id(message.id, chat_username)
-                            logger.debug(f"💾 Сохранён last_message_id={message.id} для канала @{chat_username}")
-                        
-                        # КРИТИЧЕСКИ ВАЖНО: Убираем пост из списка обрабатываемых
-                        # Это гарантирует, что пост будет удален даже при ошибке
-                        message_key = f"{chat_username}:{message.id}" if chat_username else f"{chat_id}:{message.id}"
-                        if self._processing_lock is not None:
-                            async with self._processing_lock:
-                                if message_key in self._processing_messages:
-                                    self._processing_messages.remove(message_key)
-                                    logger.debug(f"🔓 Пост {message.id} удален из списка обрабатываемых")
+                        finally:
+                            # === ГАРАНТИРОВАННОЕ СНЯТИЕ БЛОКИРОВКИ ===
+                            if self._processing_lock is not None and message_key:
+                                async with self._processing_lock:
+                                    if message_key in self._processing_messages:
+                                        self._processing_messages.remove(message_key)
+                                        # logger.debug(f"🔓 Блокировка снята для {message_key}")
                     
                     except Exception as e:
                         logger.error(f"❌ Ошибка в обработчике сообщений: {e}", exc_info=True)
-                        # КРИТИЧЕСКИ ВАЖНО: Убираем пост из списка обрабатываемых даже при ошибке
-                        # Это предотвращает блокировку поста навсегда
-                        try:
-                            message_key = f"{chat_username}:{message.id}" if chat_username else f"{chat_id}:{message.id}"
-                            if self._processing_lock is not None:
+                        # Блокировка уже снята в finally выше, но на всякий случай еще раз попробуем
+                        if self._processing_lock is not None and message_key:
+                            try:
                                 async with self._processing_lock:
                                     if message_key in self._processing_messages:
                                         self._processing_messages.remove(message_key)
                                         logger.debug(f"🔓 Пост {message.id} удален из списка обрабатываемых (после ошибки)")
-                        except:
-                            pass
+                            except:
+                                pass
                 
                 logger.info("\n🔍 Мониторинг активен! Жду новых постов...\n")
                 
@@ -1884,41 +1891,43 @@ class ChannelMonitor:
 
 
 def start_monitor_task(db: Database, bot_application=None, monitor_instance_ref=None):
-    """Запускает мониторинг в отдельном потоке
-    
-    Args:
-        db: База данных
-        bot_application: Приложение бота для отправки уведомлений
-        monitor_instance_ref: Список для сохранения ссылки на экземпляр monitor (для остановки)
-    """
+    """Запускает мониторинг в отдельном потоке с перезапуском при падении"""
     import threading
+    import time
     
     def run_monitor():
-        monitor = ChannelMonitor(db, bot_application)
-        # Сохраняем ссылку на monitor для возможности остановки
-        if monitor_instance_ref is not None:
-            monitor_instance_ref[0] = monitor
-        
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(monitor.start_monitoring())
-        except Exception as e:
-            logger.error(f"Ошибка в потоке мониторинга: {e}")
-        finally:
-            # Корректно закрываем все задачи перед закрытием loop
+        # Бесконечный цикл перезапуска потока
+        while True:
             try:
-                # Отменяем все pending задачи
-                pending = asyncio.all_tasks(loop)
-                for task in pending:
-                    task.cancel()
-                # Ждём завершения отменённых задач
-                if pending:
-                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                logger.info("🚀 Запуск потока мониторинга...")
+                monitor = ChannelMonitor(db, bot_application)
+                if monitor_instance_ref is not None:
+                    monitor_instance_ref[0] = monitor
+                
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                
+                try:
+                    loop.run_until_complete(monitor.start_monitoring())
+                except Exception as inner_e:
+                    logger.error(f"❌ Ошибка внутри asyncio loop мониторинга: {inner_e}")
+                finally:
+                    # Корректная очистка
+                    try:
+                        pending = asyncio.all_tasks(loop)
+                        for task in pending:
+                            task.cancel()
+                        if pending:
+                            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                    except:
+                        pass
+                    loop.close()
+                    
             except Exception as e:
-                logger.warning(f"Ошибка при закрытии задач: {e}")
-            finally:
-                loop.close()
+                logger.critical(f"🔥 КРИТИЧЕСКОЕ ПАДЕНИЕ МОНИТОРА: {e}. Перезапуск через 30 сек...")
+            
+            # Если мы здесь, значит монитор упал. Ждем перед рестартом.
+            time.sleep(30)
     
     thread = threading.Thread(target=run_monitor, daemon=True)
     thread.start()
